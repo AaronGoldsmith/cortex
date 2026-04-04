@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cortex"
+version = "0.1.0"
+description = "Persistent, model-agnostic knowledge ledger that compounds intelligence across AI sessions."
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+    "sentence-transformers>=2.2",
+    "sqlite-vec>=0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+cortex = "cortex.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cortex*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
