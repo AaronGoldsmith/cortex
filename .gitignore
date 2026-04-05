@@ -6,3 +6,4 @@ build/
 .pytest_cache/
 *.db
 .env
+.claude/agent-memory/

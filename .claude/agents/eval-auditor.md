@@ -2,8 +2,7 @@
 name: eval-auditor
 description: "Diagnoses weak spots in Cortex eval results, classifies failures, and applies targeted fixes to improve retrieval quality over time."
 model: sonnet
-memory: project
-tools: [Bash, Read, Write, Edit]
+tools: [Bash(cortex *)]
 ---
 
 # Eval Auditor — Why You Exist
