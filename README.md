@@ -174,13 +174,59 @@ cortex improve --update-case 3 --query "better query" --keywords "k1,k2"
 cortex improve --adjust-confidence 42 1.5
 ```
 
+## Prerequisites
+
+- **Python 3.11+**
+- **Claude Code CLI** — `cortex distill` shells out to `claude` as a subprocess to run the `signal-distiller` agent. Install Claude Code and ensure the `claude` binary is on your PATH before running distillation.
+- **sentence-transformers** — the embedding model (`all-MiniLM-L6-v2`) downloads automatically on first use (~80MB). No API key needed.
+
 ## Installation
 
 ```bash
 pip install -e .
 ```
 
-Requires Python 3.11+. The embedding model downloads automatically on first use (~80MB).
+## Recommended Hooks
+
+Cortex works best when ingestion happens automatically. Add these to your Claude Code settings (`~/.claude/settings.json`) under `"hooks"`:
+
+### Auto-ingest on session end
+
+Runs `cortex ingest` in the background every time a Claude Code session closes, keeping the ledger up to date without manual effort.
+
+```json
+"SessionEnd": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "cortex ingest --background",
+        "timeout": 10
+      }
+    ]
+  }
+]
+```
+
+### Auto-run tests after edits
+
+Runs pytest after any file edit or write, catching regressions immediately.
+
+```json
+"PostToolUse": [
+  {
+    "matcher": "Edit|Write",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "if [ -f pytest.ini ] || [ -f pyproject.toml ] || [ -d tests ]; then pytest --tb=short -q 2>/dev/null || echo 'TESTS FAILED'; fi",
+        "timeout": 30,
+        "statusMessage": "Running tests..."
+      }
+    ]
+  }
+]
+```
 
 ## Invariants
 
