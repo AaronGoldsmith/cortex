@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from cortex.config import (
     CONFIDENCE_WEIGHT,
     DEFAULT_TOP_K,
+    DISTILLATION_BOOST,
     PROJECTS_DIR,
     RECENCY_WEIGHT,
     SIMILARITY_WEIGHT,
@@ -60,7 +61,9 @@ def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None):
 
 def _score_result(row, distance, kind):
     """Compute a combined score from similarity, confidence, and recency."""
-    similarity = max(0.0, 1.0 - distance)  # sqlite-vec returns L2 distance
+    # sqlite-vec returns L2 distance; convert to cosine similarity for unit vectors:
+    # cosine_sim = 1 - (L2_dist² / 2)
+    similarity = max(0.0, 1.0 - (distance ** 2) / 2.0)
     confidence = row[5] or 1.0
 
     # Recency: exponential decay, half-life of 30 days
@@ -74,6 +77,7 @@ def _score_result(row, distance, kind):
         SIMILARITY_WEIGHT * similarity
         + CONFIDENCE_WEIGHT * confidence
         + RECENCY_WEIGHT * recency
+        + (DISTILLATION_BOOST if kind == "distillation" else 0.0)
     )
 
     return {
@@ -164,4 +168,5 @@ def format_results(results):
 
         lines.append("")
 
+    lines.append("Tip: Run 'cortex feedback <id> yes/no' to rate these results")
     return "\n".join(lines)

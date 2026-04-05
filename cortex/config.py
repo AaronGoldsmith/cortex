@@ -27,6 +27,10 @@ if platform.system() == "Windows":
 else:
     GOOSE_DB_PATH = Path.home() / ".local" / "share" / "goose" / "sessions" / "sessions.db"
 
+# Eval lifecycle
+EVAL_CASE_HISTORY_PATH = CORTEX_DIR / "eval_case_history.json"
+EVAL_CASES_RETIRED_PATH = CORTEX_DIR / "eval_cases_retired.json"
+
 # Distillation
 DEFAULT_CLUSTER_MIN = 2  # minimum entries to form a cluster
 DEFAULT_BATCH_SIZE = 10  # entries per distillation batch
@@ -39,3 +43,4 @@ ENTRY_TYPES = {"raw", "observation", "recommendation", "correction", "pattern"}
 SIMILARITY_WEIGHT = 0.6
 CONFIDENCE_WEIGHT = 0.25
 RECENCY_WEIGHT = 0.15
+DISTILLATION_BOOST = 0.15  # distillations are refined knowledge, rank above raw entries
