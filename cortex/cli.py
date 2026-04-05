@@ -95,11 +95,17 @@ def ingest(source, background, memory, subagents, ingest_all, backfill_turns):
     if background:
         # Spawn self as background process
         click.echo("cortex: ingesting session...", err=True)
+        popen_kwargs = {
+            "stdout": open(CORTEX_DIR / "ingest.log", "a"),
+            "stderr": subprocess.STDOUT,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS
+        else:
+            popen_kwargs["start_new_session"] = True
         subprocess.Popen(
             [sys.executable, "-m", "cortex.cli", "ingest"],
-            stdout=open(CORTEX_DIR / "ingest.log", "a"),
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0,
+            **popen_kwargs,
         )
         return
 
@@ -181,7 +187,7 @@ def ingest(source, background, memory, subagents, ingest_all, backfill_turns):
 @click.option("--max-batches", default=10, help="Maximum number of batches to process (limits LLM cost)")
 @click.option("--batch-size", default=10, help="Entries per batch")
 @click.option("--dry-run", is_flag=True, help="Show what would be distilled without making LLM calls")
-@click.option("--context-window", default=0, type=int, help="Include N surrounding turns from the session as LLM context (0=off, max 20)")
+@click.option("--context-window", default=3, type=int, help="Include N surrounding turns from the session as LLM context (0=off, max 20)")
 def distill(max_batches, batch_size, dry_run, context_window):
     """Extract patterns from raw entries using an LLM.
 

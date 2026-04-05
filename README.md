@@ -88,7 +88,7 @@ Entry types: `raw`, `observation`, `recommendation`, `correction`, `pattern`
 ```bash
 cortex distill --dry-run               # preview without spending tokens
 cortex distill --max-batches 5         # limit LLM calls
-cortex distill --context-window 3      # include surrounding conversation turns
+cortex distill --context-window 0      # disable conversation context (default: 3)
 ```
 
 Each batch = 1 LLM API call. Secrets are redacted before anything leaves the machine.

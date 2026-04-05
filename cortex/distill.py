@@ -49,7 +49,7 @@ Raw entries:
 {entries}"""
 
 
-def distill(conn, max_batches=10, batch_size=10, llm_call=None, dry_run=False, context_window=0):
+def distill(conn, max_batches=10, batch_size=10, llm_call=None, dry_run=False, context_window=3):
     """Run one distillation pass over undistilled entries.
 
     Args:
@@ -290,8 +290,16 @@ def _parse_response(response):
 
 def _default_llm_call(prompt):
     """Default LLM call via Claude CLI subprocess."""
+    import shutil
     import subprocess
-   # todo: experiment with using two additional flags for constructing json schema
+
+    if shutil.which("claude") is None:
+        raise RuntimeError(
+            "Claude Code CLI not found on PATH. "
+            "Install it (https://docs.anthropic.com/en/docs/claude-code) "
+            "and ensure 'claude' is available in your shell."
+        )
+    # todo: experiment with using two additional flags for constructing json schema
     result = subprocess.run(
         ["claude", "--agent", "signal-distiller", "--no-session-persistence", "-p", prompt],
         capture_output=True,
