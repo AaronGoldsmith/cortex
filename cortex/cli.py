@@ -492,6 +492,129 @@ def improve(diagnose, update_case, query, keywords, variants, remove_case, adjus
 
 
 @main.command()
+@click.argument("id_str", required=False, default=None)
+@click.argument("helpful_str", required=False, default=None)
+@click.option("--context", default=None, help="Why this was/wasn't helpful")
+@click.option("--stats", is_flag=True, help="Show aggregate feedback statistics")
+def feedback(id_str, helpful_str, context, stats):
+    """Rate a query result as helpful or not.
+
+    ID is an entry or distillation ID (prefix with 'd' for distillation).
+    HELPFUL is 'yes' or 'no'.
+
+    Examples:
+
+        cortex feedback 42 yes --context "Correctly identified the auth pattern"
+
+        cortex feedback d5 no --context "Outdated, we switched to JWT"
+
+        cortex feedback --stats
+    """
+    from cortex.db import (
+        adjust_confidence_from_feedback,
+        get_connection,
+        get_feedback_stats,
+        record_feedback,
+    )
+
+    _ensure_initialized()
+    conn = get_connection(DB_PATH)
+
+    if stats:
+        s = get_feedback_stats(conn)
+        click.echo("Feedback Statistics")
+        click.echo(f"  Total feedback:  {s['total']}")
+        click.echo(f"  Helpful:         {s['helpful_count']} ({s['helpful_rate']}%)")
+        click.echo(f"  Not helpful:     {s['unhelpful_count']}")
+
+        if s["top_helpful"]:
+            click.echo("\n  Top helpful:")
+            for item in s["top_helpful"]:
+                click.echo(f"    {item['id']}: {item['helpful']}/{item['total']} helpful")
+
+        if s["top_unhelpful"]:
+            click.echo("\n  Top unhelpful:")
+            for item in s["top_unhelpful"]:
+                click.echo(f"    {item['id']}: {item['unhelpful']}/{item['total']} unhelpful")
+
+        if s["entry_type_breakdown"]:
+            click.echo("\n  By entry type:")
+            for item in s["entry_type_breakdown"]:
+                click.echo(f"    {item['type']}: {item['helpful']}/{item['count']} helpful")
+
+        if s["pattern_type_breakdown"]:
+            click.echo("\n  By pattern type:")
+            for item in s["pattern_type_breakdown"]:
+                click.echo(f"    {item['type']}: {item['helpful']}/{item['count']} helpful")
+
+        conn.close()
+        return
+
+    # Validate required args for recording feedback
+    if not id_str or not helpful_str:
+        click.echo("Usage: cortex feedback <id> <yes|no> [--context '...']", err=True)
+        click.echo("       cortex feedback --stats", err=True)
+        conn.close()
+        sys.exit(1)
+
+    # Parse ID
+    entry_id = None
+    distillation_id = None
+    if id_str.lower().startswith("d"):
+        try:
+            distillation_id = int(id_str[1:])
+        except ValueError:
+            click.echo(f"Invalid distillation ID: {id_str}", err=True)
+            conn.close()
+            sys.exit(1)
+    else:
+        try:
+            entry_id = int(id_str)
+        except ValueError:
+            click.echo(f"Invalid entry ID: {id_str}", err=True)
+            conn.close()
+            sys.exit(1)
+
+    # Parse helpful
+    if helpful_str.lower() in ("yes", "y", "1", "true"):
+        helpful = True
+    elif helpful_str.lower() in ("no", "n", "0", "false"):
+        helpful = False
+    else:
+        click.echo(f"Invalid value for helpful: {helpful_str}. Use 'yes' or 'no'.", err=True)
+        conn.close()
+        sys.exit(1)
+
+    try:
+        feedback_id = record_feedback(
+            conn,
+            entry_id=entry_id,
+            distillation_id=distillation_id,
+            helpful=helpful,
+            context=context,
+        )
+
+        new_conf = adjust_confidence_from_feedback(
+            conn,
+            entry_id=entry_id,
+            distillation_id=distillation_id,
+            helpful=helpful,
+        )
+
+        label = f"D{distillation_id}" if distillation_id else f"E{entry_id}"
+        verdict = "helpful" if helpful else "not helpful"
+        click.echo(f"Feedback recorded: {label} marked as {verdict}")
+        if new_conf is not None:
+            click.echo(f"  Confidence adjusted to {new_conf:.2f}")
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        conn.close()
+        sys.exit(1)
+
+    conn.close()
+
+
+@main.command()
 def status():
     """Show Cortex status: entry counts, last ingest/distill, DB size."""
     _ensure_initialized()

@@ -164,4 +164,5 @@ def format_results(results):
 
         lines.append("")
 
+    lines.append("Tip: Run 'cortex feedback <id> yes/no' to rate these results")
     return "\n".join(lines)
