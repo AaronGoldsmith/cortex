@@ -53,7 +53,8 @@ def init_db(db_path: str = None) -> None:
                 confidence REAL DEFAULT 1.0,
                 content_hash TEXT UNIQUE,
                 created_at TEXT DEFAULT (datetime('now')),
-                distilled_at TEXT
+                distilled_at TEXT,
+                turn_index INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS distillations (
@@ -64,7 +65,8 @@ def init_db(db_path: str = None) -> None:
                 source_model TEXT,
                 entry_count INTEGER,
                 content_hash TEXT UNIQUE,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now')),
+                context_window INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS lineage (
@@ -95,9 +97,29 @@ def init_db(db_path: str = None) -> None:
             CREATE VIRTUAL TABLE IF NOT EXISTS distill_vec
                 USING vec0(embedding float[{EMBEDDING_DIM}]);
         """)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply schema migrations for existing databases."""
+    # Add turn_index to entries if missing
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(entries)").fetchall()}
+    if "turn_index" not in cols:
+        conn.execute("ALTER TABLE entries ADD COLUMN turn_index INTEGER")
+
+    # Add context_window to distillations if missing
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(distillations)").fetchall()}
+    if "context_window" not in cols:
+        conn.execute("ALTER TABLE distillations ADD COLUMN context_window INTEGER DEFAULT 0")
+
+    # Create index after columns exist
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entries_session_turn "
+        "ON entries(session_id, turn_index)"
+    )
 
 
 def insert_entry(
@@ -109,15 +131,16 @@ def insert_entry(
     session_id: str = None,
     confidence: float = 1.0,
     embedding: list[float] = None,
+    turn_index: int = None,
 ) -> Optional[int]:
     """Insert an entry and its embedding. Return entry id, or None if duplicate."""
     ch = _content_hash(content)
     try:
         cur = conn.execute(
             """INSERT INTO entries
-               (content, entry_type, source_model, source_project, session_id, confidence, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (content, entry_type, source_model, source_project, session_id, confidence, ch),
+               (content, entry_type, source_model, source_project, session_id, confidence, content_hash, turn_index)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (content, entry_type, source_model, source_project, session_id, confidence, ch, turn_index),
         )
         entry_id = cur.lastrowid
     except sqlite3.IntegrityError:
@@ -142,15 +165,16 @@ def insert_distillation(
     entry_count: int = None,
     embedding: list[float] = None,
     source_entry_ids: list[int] = None,
+    context_window: int = 0,
 ) -> Optional[int]:
     """Insert a distillation, its embedding, and lineage rows. Return distillation id."""
     ch = _content_hash(content)
     try:
         cur = conn.execute(
             """INSERT INTO distillations
-               (content, pattern_type, confidence, source_model, entry_count, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (content, pattern_type, confidence, source_model, entry_count, ch),
+               (content, pattern_type, confidence, source_model, entry_count, content_hash, context_window)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (content, pattern_type, confidence, source_model, entry_count, ch, context_window),
         )
         distill_id = cur.lastrowid
     except sqlite3.IntegrityError:

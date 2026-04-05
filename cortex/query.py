@@ -1,16 +1,20 @@
 """Cortex query — semantic search across the knowledge ledger."""
 
+import logging
 import math
 from datetime import datetime, timezone
 
 from cortex.config import (
     CONFIDENCE_WEIGHT,
     DEFAULT_TOP_K,
+    PROJECTS_DIR,
     RECENCY_WEIGHT,
     SIMILARITY_WEIGHT,
 )
 from cortex.db import vector_search
 from cortex.embedder import embed_query
+
+log = logging.getLogger(__name__)
 
 
 def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None):
@@ -37,15 +41,17 @@ def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None):
         if row and (project_filter is None or row[4] == project_filter):
             results.append(_score_result(row, distance, kind="entry"))
 
-    # Fetch distillation details
+    # Fetch distillation details with source context
     for dist_id, distance in distill_hits:
         row = conn.execute(
             "SELECT id, content, pattern_type, source_model, NULL, "
-            "confidence, created_at FROM distillations WHERE id = ?",
+            "confidence, created_at, context_window FROM distillations WHERE id = ?",
             (dist_id,),
         ).fetchone()
         if row:
-            results.append(_score_result(row, distance, kind="distillation"))
+            result = _score_result(row, distance, kind="distillation")
+            result["source_context"] = _get_source_context(conn, dist_id, row[7] or 0)
+            results.append(result)
 
     # Sort by combined score descending
     results.sort(key=lambda r: r["score"], reverse=True)
@@ -85,6 +91,43 @@ def _score_result(row, distance, kind):
     }
 
 
+def _get_source_context(conn, distillation_id: int, context_window: int) -> list[dict]:
+    """Follow lineage from a distillation to its source entries' conversation context.
+
+    Returns a list of dicts with keys: entry_id, user_text, assistant_text.
+    Only includes entries where we can resolve the session JSONL.
+    """
+    from cortex.sessions import find_session_file, read_session_turns
+
+    rows = conn.execute(
+        "SELECT e.id, e.content, e.session_id, e.turn_index "
+        "FROM lineage l JOIN entries e ON l.entry_id = e.id "
+        "WHERE l.distillation_id = ?",
+        (distillation_id,),
+    ).fetchall()
+
+    contexts = []
+    for row in rows:
+        entry_id, content, session_id, turn_index = row[0], row[1], row[2], row[3]
+        ctx = {"entry_id": entry_id, "user_text": content, "assistant_text": None}
+
+        if session_id and turn_index is not None:
+            try:
+                session_path = find_session_file(session_id, PROJECTS_DIR)
+                if session_path:
+                    turns = read_session_turns(session_path)
+                    for turn in turns:
+                        if turn.index == turn_index:
+                            ctx["user_text"] = turn.user_text
+                            ctx["assistant_text"] = turn.assistant_text
+                            break
+            except Exception:
+                pass  # Graceful degradation
+
+        contexts.append(ctx)
+    return contexts
+
+
 def format_results(results):
     """Format query results for CLI display."""
     if not results:
@@ -103,6 +146,22 @@ def format_results(results):
         if len(content) > 200:
             content = content[:197] + "..."
         lines.append(f"    {content}")
+
+        # Show source conversation context for distillations
+        source_ctx = r.get("source_context", [])
+        if source_ctx:
+            for ctx in source_ctx[:2]:  # Show at most 2 source turns
+                user = ctx["user_text"]
+                if len(user) > 120:
+                    user = user[:117] + "..."
+                lines.append(f"    Source:")
+                lines.append(f"      USER: {user}")
+                if ctx.get("assistant_text"):
+                    asst = ctx["assistant_text"]
+                    if len(asst) > 200:
+                        asst = asst[:197] + "..."
+                    lines.append(f"      ASSISTANT: {asst}")
+
         lines.append("")
 
     return "\n".join(lines)

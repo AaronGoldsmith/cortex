@@ -10,6 +10,9 @@ from cortex.embedder import embed
 
 log = logging.getLogger(__name__)
 
+# Cache for session turn lookups within a single ingest run
+_session_turn_cache: dict[str, list] = {}
+
 # Map memory file frontmatter types to Cortex entry types
 _MEMORY_TYPE_MAP = {
     "user": "observation",
@@ -32,8 +35,11 @@ def _save_state(state_path: Path, state: dict) -> None:
     state_path.write_text(json.dumps(state))
 
 
-def ingest_history(conn, history_path: Path, state_path: Path) -> dict:
+def ingest_history(conn, history_path: Path, state_path: Path, projects_dir: Path = None) -> dict:
     """Ingest new lines from history.jsonl into the ledger.
+
+    If projects_dir is provided, resolves turn_index for each entry by looking
+    up its position in the corresponding session JSONL file.
 
     Returns dict with keys: ingested, skipped, errors.
     """
@@ -76,6 +82,11 @@ def ingest_history(conn, history_path: Path, state_path: Path) -> dict:
                 stats["skipped"] += 1
                 continue
 
+            session_id = entry.get("sessionId")
+            turn_index = None
+            if projects_dir and session_id:
+                turn_index = _resolve_turn_index(session_id, content, projects_dir)
+
             embedding = embed(content)
             result = insert_entry(
                 conn,
@@ -83,15 +94,16 @@ def ingest_history(conn, history_path: Path, state_path: Path) -> dict:
                 entry_type="raw",
                 source_model="claude",
                 source_project=entry.get("project"),
-                session_id=entry.get("sessionId"),
+                session_id=session_id,
                 confidence=1.0,
                 embedding=embedding,
+                turn_index=turn_index,
             )
             if result is None:
                 stats["skipped"] += 1  # duplicate
             else:
                 stats["ingested"] += 1
-            state["last_session_id"] = entry.get("sessionId")
+            state["last_session_id"] = session_id
             last_line = line_no + 1
 
     state["last_line"] = last_line
@@ -269,4 +281,61 @@ def ingest_subagent_logs(conn, projects_dir: Path) -> dict:
             log.warning("Failed to process %s: %s", jsonl_file, e)
             stats["errors"] += 1
 
+    return stats
+
+
+def _resolve_turn_index(session_id: str, content: str, projects_dir: Path) -> int | None:
+    """Find the turn index of a user message within its session JSONL.
+
+    Uses the sessions module to parse turns, then matches by content.
+    Results are cached per session_id within the process.
+    """
+    if session_id in _session_turn_cache:
+        turns = _session_turn_cache[session_id]
+    else:
+        from cortex.sessions import find_session_file, read_session_turns
+
+        session_path = find_session_file(session_id, projects_dir)
+        if session_path is None:
+            _session_turn_cache[session_id] = []
+            return None
+        turns = read_session_turns(session_path)
+        _session_turn_cache[session_id] = turns
+
+    # Match by content prefix (history.jsonl display may be truncated)
+    content_stripped = content.strip()
+    for turn in turns:
+        if turn.user_text == content_stripped:
+            return turn.index
+        # Fallback: prefix match for truncated content
+        if len(content_stripped) > 50 and turn.user_text.startswith(content_stripped[:50]):
+            return turn.index
+    return None
+
+
+def backfill_turn_indices(conn, projects_dir: Path) -> dict:
+    """Backfill turn_index for existing entries that have session_id but no turn_index.
+
+    Returns dict with keys: updated, skipped.
+    """
+    rows = conn.execute(
+        "SELECT id, content, session_id FROM entries "
+        "WHERE session_id IS NOT NULL AND turn_index IS NULL"
+    ).fetchall()
+
+    stats = {"updated": 0, "skipped": 0}
+    for row in rows:
+        entry_id, content, session_id = row[0], row[1], row[2]
+        turn_index = _resolve_turn_index(session_id, content, projects_dir)
+        if turn_index is not None:
+            conn.execute(
+                "UPDATE entries SET turn_index = ? WHERE id = ?",
+                (turn_index, entry_id),
+            )
+            stats["updated"] += 1
+        else:
+            stats["skipped"] += 1
+
+    conn.commit()
+    _session_turn_cache.clear()
     return stats

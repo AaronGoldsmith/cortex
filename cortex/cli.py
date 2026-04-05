@@ -87,7 +87,8 @@ def query(text, top_k, project):
 @click.option("--memory", is_flag=True, help="Also ingest .claude/projects/*/memory/*.md files")
 @click.option("--subagents", is_flag=True, help="Also ingest subagent conversation logs")
 @click.option("--all", "ingest_all", is_flag=True, help="Ingest all sources (history + memory + subagents)")
-def ingest(background, memory, subagents, ingest_all):
+@click.option("--backfill-turns", is_flag=True, help="Populate turn_index on existing entries by matching them to session JSONL files")
+def ingest(background, memory, subagents, ingest_all, backfill_turns):
     """Ingest Claude Code session history into the ledger."""
     if background:
         # Spawn self as background process
@@ -102,13 +103,21 @@ def ingest(background, memory, subagents, ingest_all):
 
     from cortex.config import PROJECTS_DIR
     from cortex.db import get_connection
-    from cortex.ingest import ingest_history, ingest_memory_files, ingest_subagent_logs
+    from cortex.ingest import backfill_turn_indices, ingest_history, ingest_memory_files, ingest_subagent_logs
 
     _ensure_initialized()
     conn = get_connection(DB_PATH)
     try:
-        # Always ingest main history
-        stats = ingest_history(conn, HISTORY_PATH, STATE_PATH)
+        if backfill_turns:
+            bstats = backfill_turn_indices(conn, PROJECTS_DIR)
+            click.echo(
+                f"Backfill — Updated: {bstats['updated']}, "
+                f"Skipped: {bstats['skipped']}"
+            )
+            return
+
+        # Always ingest main history (now with turn_index resolution)
+        stats = ingest_history(conn, HISTORY_PATH, STATE_PATH, projects_dir=PROJECTS_DIR)
         click.echo(
             f"History — Ingested: {stats['ingested']}, "
             f"Skipped: {stats['skipped']}, "
@@ -139,22 +148,134 @@ def ingest(background, memory, subagents, ingest_all):
 
 
 @main.command()
-@click.option("--max-batches", default=10, help="Max batches to process (cost control)")
+@click.option("--max-batches", default=10, help="Maximum number of batches to process (limits LLM cost)")
 @click.option("--batch-size", default=10, help="Entries per batch")
-def distill(max_batches, batch_size):
-    """Run distillation over undistilled entries."""
+@click.option("--dry-run", is_flag=True, help="Show what would be distilled without making LLM calls")
+@click.option("--context-window", default=0, type=int, help="Include N surrounding turns from the session as LLM context (0=off, max 20)")
+def distill(max_batches, batch_size, dry_run, context_window):
+    """Extract patterns from raw entries using an LLM.
+
+    Reads undistilled entries in batches, sanitizes secrets, sends them to an
+    LLM to identify recurring patterns and insights, then writes the results
+    back as distillations with lineage to source entries. Each batch = 1 LLM
+    API call. Use --dry-run to preview before spending tokens. Use
+    --context-window N to include N surrounding conversation turns from the
+    original session, giving the distiller richer dialogue context.
+    """
     from cortex.db import get_connection
     from cortex.distill import distill as do_distill
 
     _ensure_initialized()
     conn = get_connection(DB_PATH)
-    stats = do_distill(conn, max_batches=max_batches, batch_size=batch_size)
-    click.echo(
-        f"Batches: {stats['batches']}, "
-        f"Distillations: {stats['distillations']}, "
-        f"Entries processed: {stats['entries_processed']}, "
-        f"Errors: {stats['errors']}"
-    )
+    stats = do_distill(conn, max_batches=max_batches, batch_size=batch_size, dry_run=dry_run, context_window=context_window)
+
+    if dry_run:
+        click.echo(f"DRY RUN — {stats['batches']} batches, {stats['entries_processed']} entries")
+        click.echo(f"Estimated LLM calls: {stats['batches']}")
+        click.echo()
+        for batch_info in stats.get("plan", []):
+            click.echo(f"  Batch {batch_info['batch']}: {batch_info['entry_count']} entries "
+                       f"(IDs: {batch_info['entry_ids'][:5]}{'...' if len(batch_info['entry_ids']) > 5 else ''})")
+            if batch_info["has_secrets_redacted"]:
+                click.echo(f"    ! Contains secrets that will be redacted")
+            for preview in batch_info["preview"]:
+                click.echo(f"    - {preview}")
+            click.echo()
+    else:
+        skipped = stats.get('skipped', 0)
+        click.echo(
+            f"Batches: {stats['batches']}, "
+            f"Distillations: {stats['distillations']}, "
+            f"Entries processed: {stats['entries_processed']}, "
+            f"Skipped (insufficient context): {skipped}, "
+            f"Errors: {stats['errors']}"
+        )
+    conn.close()
+
+
+@main.command()
+@click.argument("distillation_id", type=int)
+@click.option("--window", default=5, type=int, help="Number of conversation turns to show before and after each source entry")
+def trace(distillation_id, window):
+    """Trace a distillation back to its source entries and conversation.
+
+    Given a distillation ID, shows its content, the source entries that
+    produced it (via lineage), and the surrounding conversation turns from
+    the original session JSONL files so you can see the full context.
+    """
+    from cortex.config import PROJECTS_DIR
+    from cortex.db import get_connection
+    from cortex.sessions import find_session_file, format_turn, get_turn_context, read_session_turns
+
+    _ensure_initialized()
+    conn = get_connection(DB_PATH)
+
+    # Fetch the distillation
+    dist = conn.execute(
+        "SELECT id, content, pattern_type, confidence, context_window, created_at "
+        "FROM distillations WHERE id = ?",
+        (distillation_id,),
+    ).fetchone()
+    if not dist:
+        click.echo(f"Distillation {distillation_id} not found.")
+        conn.close()
+        return
+
+    click.echo(f"Distillation D{dist[0]}")
+    click.echo(f"  Pattern:    {dist[1]}")
+    click.echo(f"  Type:       {dist[2]}")
+    click.echo(f"  Confidence: {dist[3]}")
+    click.echo(f"  Context window used: {dist[4] or 0}")
+    click.echo(f"  Created:    {dist[5]}")
+    click.echo()
+
+    # Fetch source entries via lineage
+    rows = conn.execute(
+        "SELECT e.id, e.content, e.session_id, e.turn_index, e.source_project, e.created_at "
+        "FROM lineage l JOIN entries e ON l.entry_id = e.id "
+        "WHERE l.distillation_id = ? ORDER BY e.created_at",
+        (distillation_id,),
+    ).fetchall()
+
+    if not rows:
+        click.echo("  No source entries found in lineage.")
+        conn.close()
+        return
+
+    def _safe_echo(text):
+        """Echo text, replacing unencodable chars for Windows terminals."""
+        try:
+            click.echo(text)
+        except UnicodeEncodeError:
+            click.echo(text.encode("ascii", errors="replace").decode("ascii"))
+
+    _safe_echo(f"Source entries ({len(rows)}):")
+    for row in rows:
+        eid, content, session_id, turn_index, project, created = row[0], row[1], row[2], row[3], row[4], row[5]
+        _safe_echo(f"\n  Entry E{eid} (project: {project}, date: {created})")
+        content_preview = content[:150] + "..." if len(content) > 150 else content
+        _safe_echo(f"    Content: {content_preview}")
+
+        if session_id and turn_index is not None:
+            session_path = find_session_file(session_id, PROJECTS_DIR)
+            if session_path:
+                context_turns = get_turn_context(session_path, turn_index, window)
+                if context_turns:
+                    _safe_echo(f"    Conversation (turn {turn_index} +-{window}):")
+                    for turn in context_turns:
+                        marker = ">>>" if turn.index == turn_index else "   "
+                        user_text = turn.user_text[:120] + "..." if len(turn.user_text) > 120 else turn.user_text
+                        _safe_echo(f"      {marker} [{turn.index}] USER: {user_text}")
+                        if turn.assistant_text:
+                            asst = turn.assistant_text[:200] + "..." if len(turn.assistant_text) > 200 else turn.assistant_text
+                            _safe_echo(f"      {marker}      ASSISTANT: {asst}")
+                else:
+                    click.echo(f"    (no conversation context available)")
+            else:
+                click.echo(f"    Session file not found for {session_id}")
+        else:
+            click.echo(f"    (no turn_index — run 'cortex ingest --backfill-turns' to resolve)")
+
     conn.close()
 
 
@@ -163,11 +284,14 @@ def distill(max_batches, batch_size):
 @click.option("--seed-qa", is_flag=True, help="Generate Q&A eval cases from curated memory entries")
 @click.option("--top-k", default=5, help="Results per query to evaluate")
 @click.option("--history", is_flag=True, help="Show eval trend over time")
-def run_eval(generate, seed_qa, top_k, history):
+@click.option("--backfill-variants", is_flag=True, help="Add query variants to existing cases that lack them")
+@click.option("--compare-context", "compare_context_flag", is_flag=True, help="A/B eval: distillation quality with vs without conversation context")
+def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_context_flag):
     """Run evaluation suite against current knowledge base."""
     from cortex.db import get_connection
     from cortex.eval import (
         EVAL_CASES_PATH,
+        backfill_variants as do_backfill,
         compare_evals,
         generate_eval_cases,
         load_eval_cases,
@@ -180,6 +304,13 @@ def run_eval(generate, seed_qa, top_k, history):
 
     _ensure_initialized()
     conn = get_connection(DB_PATH)
+
+    if compare_context_flag:
+        from cortex.eval import compare_context, format_context_comparison
+        result = compare_context(conn, sample_size=20, context_window=2)
+        click.echo(format_context_comparison(result))
+        conn.close()
+        return
 
     if history:
         h = load_eval_history()
@@ -214,6 +345,11 @@ def run_eval(generate, seed_qa, top_k, history):
         conn.close()
         return
 
+    if backfill_variants:
+        count = do_backfill(cases)
+        save_eval_cases(EVAL_CASES_PATH, cases)
+        click.echo(f"Backfilled variants on {count} cases")
+
     report = run_eval(conn, cases, top_k=top_k)
     click.echo(report.summary())
 
@@ -229,10 +365,11 @@ def run_eval(generate, seed_qa, top_k, history):
 @click.option("--update-case", type=int, default=None, help="Update eval case by index (0-based)")
 @click.option("--query", default=None, help="New query for updated case")
 @click.option("--keywords", default=None, help="Comma-separated expected keywords for updated case")
+@click.option("--variants", default=None, help="Comma-separated query variants for updated case")
 @click.option("--remove-case", type=int, default=None, help="Remove eval case by index (0-based)")
 @click.option("--adjust-confidence", nargs=2, type=click.Tuple([int, float]), default=None,
               help="Adjust entry confidence: ENTRY_ID NEW_CONFIDENCE")
-def improve(diagnose, update_case, query, keywords, remove_case, adjust_confidence):
+def improve(diagnose, update_case, query, keywords, variants, remove_case, adjust_confidence):
     """Tools for the eval-auditor agent to diagnose and fix weak spots."""
     from cortex.db import get_connection
     from cortex.eval import EVAL_CASES_PATH, load_eval_cases, run_eval, save_eval_cases
@@ -287,6 +424,8 @@ def improve(diagnose, update_case, query, keywords, remove_case, adjust_confiden
             cases[update_case].query = query
         if keywords:
             cases[update_case].expected_keywords = [k.strip() for k in keywords.split(",")]
+        if variants:
+            cases[update_case].query_variants = [v.strip() for v in variants.split(",")]
         save_eval_cases(EVAL_CASES_PATH, cases)
         click.echo(f"Updated case {update_case}: {cases[update_case].description}")
         return
@@ -309,7 +448,7 @@ def improve(diagnose, update_case, query, keywords, remove_case, adjust_confiden
             (new_conf, int(entry_id)),
         )
         conn.commit()
-        click.echo(f"Entry {int(entry_id)} confidence → {new_conf}")
+        click.echo(f"Entry {int(entry_id)} confidence -> {new_conf}")
         conn.close()
         return
 

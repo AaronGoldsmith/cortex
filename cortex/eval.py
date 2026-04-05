@@ -1,6 +1,7 @@
 """Cortex eval — measure whether knowledge retrieval is improving over time."""
 
 import json
+import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,13 @@ class EvalCase:
     anti_keywords: list[str]  # words/phrases that should NOT dominate results
     description: str  # human-readable description of what this tests
     answer: str = ""  # ground truth answer (for Q&A evals)
+    query_variants: list[str] = field(default_factory=list)  # paraphrased alternatives
+
+    def pick_query(self) -> str:
+        """Return a randomly selected query variant, or the primary query."""
+        if not self.query_variants:
+            return self.query
+        return random.choice([self.query] + self.query_variants)
 
 
 @dataclass
@@ -75,6 +83,8 @@ def load_eval_cases(path: Path) -> list[EvalCase]:
             expected_keywords=c["expected_keywords"],
             anti_keywords=c.get("anti_keywords", []),
             description=c.get("description", c["query"]),
+            answer=c.get("answer", ""),
+            query_variants=c.get("query_variants", []),
         )
         for c in data
     ]
@@ -127,12 +137,17 @@ def _eval_single(results: list[dict], case: EvalCase) -> CaseResult:
 
 
 def run_eval(conn, cases: list[EvalCase], top_k: int = 5) -> EvalReport:
-    """Run all eval cases against current DB state. Return scored report."""
+    """Run all eval cases against current DB state. Return scored report.
+
+    When a case has query_variants, a random variant is selected each run
+    so the eval doesn't overfit to a single phrasing.
+    """
     from cortex.query import query
 
     case_results = []
     for case in cases:
-        results = query(conn, case.query, top_k=top_k)
+        selected_query = case.pick_query()
+        results = query(conn, selected_query, top_k=top_k)
         cr = _eval_single(results, case)
         case_results.append(cr)
 
@@ -151,11 +166,45 @@ def run_eval(conn, cases: list[EvalCase], top_k: int = 5) -> EvalReport:
     )
 
 
+def _project_variants(name: str) -> list[str]:
+    """Generate query paraphrases for a project name."""
+    return [
+        f"tell me about {name}",
+        f"{name} overview",
+        f"what's in cortex about {name}?",
+        f"{name} details and context",
+        f"summarize {name}",
+    ]
+
+
+def _knowledge_variants(topic: str) -> list[str]:
+    """Generate query paraphrases for 'what do I know about X?'."""
+    return [
+        f"tell me about {topic}",
+        f"{topic} overview",
+        f"summarize {topic} knowledge",
+        f"what's in cortex about {topic}?",
+        f"{topic} details and context",
+    ]
+
+
+def _avoidance_variants(topic: str) -> list[str]:
+    """Generate query paraphrases for 'what should I avoid when X?'."""
+    return [
+        f"{topic} pitfalls",
+        f"common mistakes with {topic}",
+        f"warnings about {topic}",
+        f"{topic} best practices",
+        f"gotchas for {topic}",
+    ]
+
+
 def generate_eval_cases(conn) -> list[EvalCase]:
     """Auto-generate eval cases from existing entries and distillations.
 
     Examines the topics present in the DB and creates eval cases that
     test whether querying those topics returns relevant results.
+    Each case includes query variants so the eval rotates phrasings.
     """
     cases = []
 
@@ -177,6 +226,7 @@ def generate_eval_cases(conn) -> list[EvalCase]:
                 expected_keywords=[project_name.lower()],
                 anti_keywords=[],
                 description=f"Query for project '{project_name}' returns its entries",
+                query_variants=_project_variants(project_name),
             )
         )
 
@@ -305,6 +355,7 @@ def seed_qa_cases(conn) -> list[EvalCase]:
 
     These are real knowledge assertions: "if someone asks X, Cortex should know Y."
     Uses memory files (confidence > 1.0) as ground truth since they're human-curated.
+    Each case includes query_variants so the eval rotates phrasings per run.
     """
     cases = []
     seen_queries = set()
@@ -330,13 +381,17 @@ def seed_qa_cases(conn) -> list[EvalCase]:
         # Use first sentence or first 80 chars as the "answer"
         answer = clean.split(".")[0].strip() if "." in clean else clean[:80]
 
-        # Build query as a question someone might ask
+        # Build query and variants based on entry type
+        topic = _extract_topic(clean)
         if entry_type == "correction":
-            query = f"what should I avoid when {_extract_topic(clean)}?"
+            query = f"what should I avoid when {topic}?"
+            variants = _avoidance_variants(topic)
         elif project:
             query = f"what do I know about {project}?"
+            variants = _knowledge_variants(project)
         else:
-            query = f"what do I know about {_extract_topic(clean)}?"
+            query = f"what do I know about {topic}?"
+            variants = _knowledge_variants(topic)
 
         # Expected keywords from the answer
         keywords = [w.lower().strip(".,;:!?\"'()[]") for w in answer.split() if len(w) > 4][:3]
@@ -355,6 +410,7 @@ def seed_qa_cases(conn) -> list[EvalCase]:
                 anti_keywords=[],
                 description=f"Q&A: {query[:60]}",
                 answer=answer,
+                query_variants=variants,
             )
         )
 
@@ -365,3 +421,354 @@ def _extract_topic(text: str) -> str:
     """Pull a short topic phrase from text for question generation."""
     words = [w for w in text.split()[:8] if len(w) > 3]
     return " ".join(words[:4]).lower().rstrip(".,;:!?")
+
+
+def backfill_variants(cases: list[EvalCase]) -> int:
+    """Add query_variants to existing cases that don't have them.
+
+    Infers the variant template from the query pattern. Returns the
+    number of cases that were updated.
+    """
+    updated = 0
+    for case in cases:
+        if case.query_variants:
+            continue
+
+        q = case.query.lower()
+
+        # Project query pattern: "{name} project"
+        if q.endswith(" project"):
+            name = case.query.rsplit(" ", 1)[0]
+            case.query_variants = _project_variants(name)
+            updated += 1
+
+        # Knowledge query pattern: "what do I know about {topic}?"
+        elif "what do i know about" in q:
+            topic = case.query.split("about", 1)[1].strip().rstrip("?")
+            case.query_variants = _knowledge_variants(topic)
+            updated += 1
+
+        # Avoidance query pattern: "what should I avoid when {topic}?"
+        elif "what should i avoid" in q:
+            topic = case.query.split("when", 1)[1].strip().rstrip("?") if "when" in q else case.query
+            case.query_variants = _avoidance_variants(topic)
+            updated += 1
+
+        # Freeform topic query — generate generic rephrasings
+        else:
+            topic = case.query.rstrip("?").strip()
+            case.query_variants = [
+                f"tell me about {topic}",
+                f"{topic} explained",
+                f"details on {topic}",
+                f"context for {topic}",
+            ]
+            updated += 1
+
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Context A/B comparison eval
+# ---------------------------------------------------------------------------
+
+JUDGE_PROMPT = """You are a blind quality judge for knowledge distillations. You will see two distillation outputs (A and B) produced from the same source entries. You do NOT know which method produced which output. Score each on three dimensions (1-5):
+
+- Specificity: Does it reference concrete details vs vague generalizations?
+- Actionability: Could someone act on this pattern?
+- Grounding: Does it feel grounded in a real situation?
+
+Source entries:
+{entries}
+
+--- Distillation A ---
+{distillation_a}
+
+--- Distillation B ---
+{distillation_b}
+
+Respond with ONLY a JSON object:
+{{
+  "a": {{"specificity": N, "actionability": N, "grounding": N}},
+  "b": {{"specificity": N, "actionability": N, "grounding": N}}
+}}
+"""
+
+
+def compare_context(conn, sample_size=20, context_window=2, llm_call=None) -> dict:
+    """A/B eval comparing distillation quality with vs without conversation context.
+
+    Three tests:
+    1. Quality Lift — re-distill entries with and without context, judge both.
+    2. Rescue Rate — try distilling previously-skipped entries with context.
+    3. Blind Judge — LLM scores each pair on specificity/actionability/grounding.
+
+    Returns dict with quality_lift, rescue, and summary keys.
+    """
+    from cortex.distill import (
+        DISTILL_PROMPT,
+        _default_llm_call,
+        _get_conversation_context,
+        _parse_response,
+    )
+    from cortex.sanitize import sanitize
+
+    if llm_call is None:
+        llm_call = _default_llm_call
+
+    result = {
+        "quality_lift": {"sample_size": 0, "pairs": [], "avg_old_score": 0.0, "avg_new_score": 0.0},
+        "rescue": {"sample_size": 0, "rescued": 0, "rescue_rate": 0.0, "examples": []},
+        "summary": "",
+    }
+
+    # ------------------------------------------------------------------
+    # Test 1 + 3: Quality Lift + Blind Judge
+    # ------------------------------------------------------------------
+    distilled_rows = conn.execute(
+        "SELECT e.id, e.content, e.session_id, e.turn_index, e.source_project, e.created_at "
+        "FROM entries e "
+        "WHERE e.distilled_at IS NOT NULL "
+        "  AND e.distilled_at NOT LIKE 'skipped:%' "
+        "  AND e.turn_index IS NOT NULL "
+        "ORDER BY RANDOM() LIMIT ?",
+        (sample_size,),
+    ).fetchall()
+
+    pairs = []
+    for row in distilled_rows:
+        eid, content, session_id, turn_index, project, created = (
+            row[0], row[1], row[2], row[3], row[4], row[5],
+        )
+
+        sanitized = sanitize(content)
+        proj_short = str(project or "unknown")
+        if "\\" in proj_short or "/" in proj_short:
+            proj_short = proj_short.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+        header = f"[Entry {eid}] (project: {proj_short}, date: {created})"
+
+        # Prompt WITHOUT context
+        no_ctx_text = f"{header}: {sanitized}"
+        prompt_no_ctx = DISTILL_PROMPT.format(entries=no_ctx_text)
+
+        # Prompt WITH context
+        ctx_text_block = _get_conversation_context(session_id, turn_index, context_window)
+        if ctx_text_block:
+            with_ctx_text = (
+                f"{header}:\n"
+                f"  Conversation context:\n{ctx_text_block}\n"
+                f"  >>> Focal message: {sanitized}"
+            )
+        else:
+            with_ctx_text = no_ctx_text  # fallback — no session file
+        prompt_with_ctx = DISTILL_PROMPT.format(entries=with_ctx_text)
+
+        try:
+            old_resp = llm_call(prompt_no_ctx)
+            new_resp = llm_call(prompt_with_ctx)
+        except Exception:
+            continue
+
+        # Extract the text of each distillation for judging
+        try:
+            old_parsed = _parse_response(old_resp)
+            new_parsed = _parse_response(new_resp)
+        except Exception:
+            continue
+
+        def _patterns_text(parsed):
+            if isinstance(parsed, dict):
+                pats = parsed.get("patterns", [])
+            else:
+                pats = parsed
+            return "\n".join(p.get("content", "") for p in pats if isinstance(p, dict))
+
+        old_text = _patterns_text(old_parsed)
+        new_text = _patterns_text(new_parsed)
+
+        if not old_text and not new_text:
+            continue
+
+        # Test 3: Blind Judge — randomize which is A vs B
+        import random as _rand
+        if _rand.random() < 0.5:
+            a_text, b_text, a_label, b_label = old_text, new_text, "old", "new"
+        else:
+            a_text, b_text, a_label, b_label = new_text, old_text, "new", "old"
+
+        judge_prompt = JUDGE_PROMPT.format(
+            entries=sanitized[:500],
+            distillation_a=a_text,
+            distillation_b=b_text,
+        )
+
+        scores = {"old": {"specificity": 3, "actionability": 3, "grounding": 3},
+                  "new": {"specificity": 3, "actionability": 3, "grounding": 3}}
+        try:
+            judge_resp = llm_call(judge_prompt)
+            judge_data = json.loads(
+                judge_resp.strip() if judge_resp.strip().startswith("{")
+                else judge_resp[judge_resp.index("{"):judge_resp.rindex("}") + 1]
+            )
+            scores[a_label] = judge_data.get("a", scores[a_label])
+            scores[b_label] = judge_data.get("b", scores[b_label])
+        except Exception:
+            pass  # keep default scores
+
+        pairs.append({
+            "entry_id": eid,
+            "old": old_text[:300],
+            "new": new_text[:300],
+            "scores": scores,
+        })
+
+    # Compute averages
+    def _avg_total(score_dict):
+        return sum(score_dict.values()) / max(len(score_dict), 1)
+
+    if pairs:
+        avg_old = sum(_avg_total(p["scores"]["old"]) for p in pairs) / len(pairs)
+        avg_new = sum(_avg_total(p["scores"]["new"]) for p in pairs) / len(pairs)
+    else:
+        avg_old = avg_new = 0.0
+
+    result["quality_lift"] = {
+        "sample_size": len(pairs),
+        "pairs": pairs,
+        "avg_old_score": round(avg_old, 2),
+        "avg_new_score": round(avg_new, 2),
+    }
+
+    # ------------------------------------------------------------------
+    # Test 2: Rescue Rate
+    # ------------------------------------------------------------------
+    skipped_rows = conn.execute(
+        "SELECT e.id, e.content, e.session_id, e.turn_index, e.source_project, e.created_at "
+        "FROM entries e "
+        "WHERE e.distilled_at LIKE 'skipped:%' "
+        "  AND e.turn_index IS NOT NULL "
+        "ORDER BY RANDOM() LIMIT ?",
+        (sample_size,),
+    ).fetchall()
+
+    rescued_examples = []
+    for row in skipped_rows:
+        eid, content, session_id, turn_index, project, created = (
+            row[0], row[1], row[2], row[3], row[4], row[5],
+        )
+
+        sanitized = sanitize(content)
+        proj_short = str(project or "unknown")
+        if "\\" in proj_short or "/" in proj_short:
+            proj_short = proj_short.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+        header = f"[Entry {eid}] (project: {proj_short}, date: {created})"
+        ctx_text_block = _get_conversation_context(session_id, turn_index, context_window)
+        if ctx_text_block:
+            entry_text = (
+                f"{header}:\n"
+                f"  Conversation context:\n{ctx_text_block}\n"
+                f"  >>> Focal message: {sanitized}"
+            )
+        else:
+            entry_text = f"{header}: {sanitized}"
+
+        prompt = DISTILL_PROMPT.format(entries=entry_text)
+        try:
+            resp = llm_call(prompt)
+            parsed = _parse_response(resp)
+        except Exception:
+            continue
+
+        if isinstance(parsed, dict):
+            patterns = parsed.get("patterns", [])
+        else:
+            patterns = parsed
+
+        if patterns:
+            rescued_examples.append({
+                "entry_id": eid,
+                "content": content[:200],
+                "pattern": patterns[0].get("content", "")[:200],
+            })
+
+    rescue_total = len(skipped_rows)
+    result["rescue"] = {
+        "sample_size": rescue_total,
+        "rescued": len(rescued_examples),
+        "rescue_rate": round(len(rescued_examples) / max(rescue_total, 1), 2),
+        "examples": rescued_examples,
+    }
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    lines = []
+    ql = result["quality_lift"]
+    rs = result["rescue"]
+    lines.append(f"Quality Lift: {ql['sample_size']} pairs evaluated")
+    lines.append(f"  Avg score WITHOUT context: {ql['avg_old_score']:.2f}/5")
+    lines.append(f"  Avg score WITH context:    {ql['avg_new_score']:.2f}/5")
+    if ql["avg_old_score"] > 0:
+        delta = ql["avg_new_score"] - ql["avg_old_score"]
+        pct = delta / ql["avg_old_score"] * 100
+        lines.append(f"  Delta: {'+' if delta >= 0 else ''}{delta:.2f} ({'+' if pct >= 0 else ''}{pct:.1f}%)")
+    lines.append(f"Rescue Rate: {rs['rescued']}/{rs['sample_size']} previously-skipped entries produced patterns with context")
+    if rs["sample_size"] > 0:
+        lines.append(f"  Rate: {rs['rescue_rate']:.0%}")
+    result["summary"] = "\n".join(lines)
+
+    return result
+
+
+def format_context_comparison(result: dict) -> str:
+    """Format compare_context() output for CLI display."""
+    lines = ["=" * 60, "Context A/B Comparison", "=" * 60, ""]
+
+    # Quality Lift
+    ql = result["quality_lift"]
+    lines.append(f"TEST 1 & 3: Quality Lift + Blind Judge ({ql['sample_size']} pairs)")
+    lines.append("-" * 40)
+    lines.append(f"  Avg score WITHOUT context: {ql['avg_old_score']:.2f}/5")
+    lines.append(f"  Avg score WITH context:    {ql['avg_new_score']:.2f}/5")
+    if ql["avg_old_score"] > 0:
+        delta = ql["avg_new_score"] - ql["avg_old_score"]
+        pct = delta / ql["avg_old_score"] * 100
+        lines.append(f"  Delta: {'+' if delta >= 0 else ''}{delta:.2f} ({'+' if pct >= 0 else ''}{pct:.1f}%)")
+    lines.append("")
+
+    for i, pair in enumerate(ql["pairs"][:10]):  # show first 10
+        old_s = pair["scores"]["old"]
+        new_s = pair["scores"]["new"]
+        old_avg = sum(old_s.values()) / max(len(old_s), 1)
+        new_avg = sum(new_s.values()) / max(len(new_s), 1)
+        marker = "+" if new_avg > old_avg else ("-" if new_avg < old_avg else "=")
+        lines.append(f"  [{marker}] Entry {pair['entry_id']}: "
+                      f"old={old_avg:.1f} new={new_avg:.1f}")
+        lines.append(f"      Old: {pair['old'][:80]}{'...' if len(pair['old']) > 80 else ''}")
+        lines.append(f"      New: {pair['new'][:80]}{'...' if len(pair['new']) > 80 else ''}")
+        lines.append("")
+
+    # Rescue Rate
+    rs = result["rescue"]
+    lines.append(f"TEST 2: Rescue Rate ({rs['sample_size']} skipped entries)")
+    lines.append("-" * 40)
+    lines.append(f"  Rescued: {rs['rescued']}/{rs['sample_size']}")
+    if rs["sample_size"] > 0:
+        lines.append(f"  Rate: {rs['rescue_rate']:.0%}")
+    lines.append("")
+
+    for ex in rs["examples"][:5]:  # show first 5
+        lines.append(f"  Entry {ex['entry_id']}:")
+        lines.append(f"    Source:  {ex['content'][:80]}{'...' if len(ex['content']) > 80 else ''}")
+        lines.append(f"    Pattern: {ex['pattern'][:80]}{'...' if len(ex['pattern']) > 80 else ''}")
+        lines.append("")
+
+    # Summary
+    lines.append("=" * 60)
+    lines.append("SUMMARY")
+    lines.append("=" * 60)
+    lines.append(result["summary"])
+
+    return "\n".join(lines)

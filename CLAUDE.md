@@ -16,6 +16,7 @@ Three components forming a loop:
 - Model-agnostic: any LLM can read/write via the CLI. No Anthropic-specific dependencies.
 - Idempotent ingestion: running `cortex ingest` multiple times produces the same result.
 - Lineage tracking: every distillation links back to the source entries that produced it.
+- Conversation context on demand (Option B): assistant responses are not stored in the DB. Conversation context is pulled at runtime from session JSONL files, referenced via turn_index on entries.
 
 ## Tech Stack
 
@@ -30,10 +31,11 @@ Three components forming a loop:
 - `cortex init` — create ~/.cortex/ and initialize DB
 - `cortex write` — add an entry to the ledger
 - `cortex query` — semantic search across entries and distillations
-- `cortex ingest` — parse Claude Code history.jsonl, deduplicate, embed, store. Flags: `--memory`, `--subagents`, `--all`
-- `cortex distill` — cluster raw entries, sanitize, call LLM, write distillations
+- `cortex ingest` — parse Claude Code history.jsonl, deduplicate, embed, store. Flags: `--memory`, `--subagents`, `--all`, `--backfill-turns`
+- `cortex distill` — cluster raw entries, sanitize, call LLM, write distillations. Flags: `--context-window N`
 - `cortex eval` — run evaluation suite. Flags: `--generate`, `--seed-qa`, `--history`
 - `cortex improve` — diagnostic tools for the eval-auditor agent. Flags: `--diagnose`, `--update-case`, `--remove-case`, `--adjust-confidence`
+- `cortex trace` — show the conversation context around a specific entry or distillation
 - `cortex status` — show entry counts, last ingest/distill times, DB size
 
 ## Agents
@@ -53,6 +55,7 @@ cortex/
   distill.py    — Clustering, sanitization, LLM calls, write-back
   query.py      — Vector search + ranking
   sanitize.py   — Secret detection/redaction before LLM calls
+  sessions.py   — Runtime conversation context loader from session JSONL files
 tests/
   test_db.py
   test_embedder.py
@@ -65,3 +68,6 @@ tests/
 ## Testing
 
 Run tests with: `pytest tests/ -v`
+
+## Executing CLI Commands
+You do *not* need to prefix with `python -m`. Execute with `cortex <command> <arg>` directly
