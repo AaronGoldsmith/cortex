@@ -6,6 +6,7 @@ patterns to an active AI session via the Model Context Protocol.
 
 from mcp.server.fastmcp import FastMCP
 
+from cortex.config import DB_PATH
 from cortex.db import get_connection
 from cortex.query import query
 
@@ -47,22 +48,29 @@ def _format_result(result: dict) -> str:
             if turn.get("user_text"):
                 lines.append(f"\n**User:** {turn['user_text']}")
             if turn.get("assistant_text"):
-                lines.append(f"\n**Assistant:** {turn['assistant_text']}")
+                asst = turn["assistant_text"]
+                if len(asst) > 800:
+                    asst = asst[:797] + "..."
+                lines.append(f"\n**Assistant:** {asst}")
 
     return "\n".join(lines)
 
 
 @mcp.tool()
-def search_project_history(query_text: str) -> str:
+def search_project_history(query_text: str, project_name: str = None) -> str:
     """Search the Cortex knowledge ledger for past debugging sessions,
     architectural decisions, and distilled patterns.
 
     Args:
         query_text: Natural language query describing what you're looking for.
+        project_name: Optional project directory name to filter results by.
     """
+    if not DB_PATH.exists():
+        return "Cortex database not initialized. Run `cortex init` first."
+
     conn = get_connection()
     try:
-        results = query(conn, query_text)
+        results = query(conn, query_text, top_k=4, project_filter=project_name)
     finally:
         conn.close()
 
