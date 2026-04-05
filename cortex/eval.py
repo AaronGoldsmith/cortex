@@ -8,6 +8,7 @@ from pathlib import Path
 from cortex.config import CORTEX_DIR
 
 EVAL_CASES_PATH = CORTEX_DIR / "eval_cases.json"
+EVAL_HISTORY_PATH = CORTEX_DIR / "eval_history.jsonl"
 
 
 @dataclass
@@ -16,6 +17,7 @@ class EvalCase:
     expected_keywords: list[str]  # words/phrases that SHOULD appear in results
     anti_keywords: list[str]  # words/phrases that should NOT dominate results
     description: str  # human-readable description of what this tests
+    answer: str = ""  # ground truth answer (for Q&A evals)
 
 
 @dataclass
@@ -231,3 +233,135 @@ def generate_eval_cases(conn) -> list[EvalCase]:
                 )
 
     return cases
+
+
+def snapshot_eval(report: EvalReport, history_path: Path = EVAL_HISTORY_PATH) -> None:
+    """Append an eval report to the history log for tracking over time."""
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": report.timestamp,
+        "total_cases": report.total_cases,
+        "avg_relevance": report.avg_relevance,
+        "avg_precision": report.avg_precision,
+        "avg_noise": report.avg_noise,
+    }
+    with open(history_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def load_eval_history(history_path: Path = EVAL_HISTORY_PATH) -> list[dict]:
+    """Load eval history for trend comparison."""
+    if not history_path.exists():
+        return []
+    entries = []
+    with open(history_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return entries
+
+
+def compare_evals(history: list[dict]) -> str:
+    """Format eval history as a trend comparison."""
+    if len(history) < 2:
+        return "Not enough history to compare (need at least 2 runs)."
+
+    lines = ["Eval History (last 10 runs):", ""]
+    lines.append(f"  {'Timestamp':<28} {'Relevance':>10} {'Precision':>10} {'Noise':>10}")
+    lines.append(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 10}")
+
+    for entry in history[-10:]:
+        lines.append(
+            f"  {entry['timestamp']:<28} "
+            f"{entry['avg_relevance']:>9.1%} "
+            f"{entry['avg_precision']:>9.1%} "
+            f"{entry['avg_noise']:>9.1%}"
+        )
+
+    # Compute delta between first and last
+    first, last = history[0], history[-1]
+    rel_delta = last["avg_relevance"] - first["avg_relevance"]
+    prec_delta = last["avg_precision"] - first["avg_precision"]
+    noise_delta = last["avg_noise"] - first["avg_noise"]
+
+    lines.append("")
+    lines.append(
+        f"  Trend: relevance {'+' if rel_delta >= 0 else ''}{rel_delta:.1%}, "
+        f"precision {'+' if prec_delta >= 0 else ''}{prec_delta:.1%}, "
+        f"noise {'+' if noise_delta >= 0 else ''}{noise_delta:.1%}"
+    )
+    better = rel_delta > 0 or prec_delta > 0 or noise_delta < 0
+    lines.append(f"  Overall: {'IMPROVING' if better else 'DEGRADING or STABLE'}")
+
+    return "\n".join(lines)
+
+
+def seed_qa_cases(conn) -> list[EvalCase]:
+    """Generate Q&A eval cases from memory-sourced entries (high-confidence, curated).
+
+    These are real knowledge assertions: "if someone asks X, Cortex should know Y."
+    Uses memory files (confidence > 1.0) as ground truth since they're human-curated.
+    """
+    cases = []
+    seen_queries = set()
+
+    # Pull curated entries (memory files have confidence 1.2)
+    rows = conn.execute(
+        "SELECT content, entry_type, source_project FROM entries "
+        "WHERE confidence > 1.0 AND length(content) > 30 "
+        "ORDER BY created_at DESC LIMIT 30"
+    ).fetchall()
+
+    for row in rows:
+        content = row[0] if isinstance(row, (tuple, list)) else row["content"]
+        entry_type = row[1] if isinstance(row, (tuple, list)) else row["entry_type"]
+        project = row[2] if isinstance(row, (tuple, list)) else row["source_project"]
+
+        # Strip [name] prefix if present
+        clean = content
+        if clean.startswith("[") and "] " in clean:
+            clean = clean.split("] ", 1)[1]
+
+        # Generate a natural question from the content
+        # Use first sentence or first 80 chars as the "answer"
+        answer = clean.split(".")[0].strip() if "." in clean else clean[:80]
+
+        # Build query as a question someone might ask
+        if entry_type == "correction":
+            query = f"what should I avoid when {_extract_topic(clean)}?"
+        elif project:
+            query = f"what do I know about {project}?"
+        else:
+            query = f"what do I know about {_extract_topic(clean)}?"
+
+        # Expected keywords from the answer
+        keywords = [w.lower().strip(".,;:!?\"'()[]") for w in answer.split() if len(w) > 4][:3]
+        if not keywords:
+            continue
+
+        # Dedup by query text
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+
+        cases.append(
+            EvalCase(
+                query=query,
+                expected_keywords=keywords,
+                anti_keywords=[],
+                description=f"Q&A: {query[:60]}",
+                answer=answer,
+            )
+        )
+
+    return cases
+
+
+def _extract_topic(text: str) -> str:
+    """Pull a short topic phrase from text for question generation."""
+    words = [w for w in text.split()[:8] if len(w) > 3]
+    return " ".join(words[:4]).lower().rstrip(".,;:!?")

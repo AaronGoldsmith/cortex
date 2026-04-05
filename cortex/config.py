@@ -16,6 +16,7 @@ EMBEDDING_DIM = 384
 # Claude Code history
 CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_PATH = CLAUDE_DIR / "history.jsonl"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 # Distillation
 DEFAULT_CLUSTER_MIN = 2  # minimum entries to form a cluster

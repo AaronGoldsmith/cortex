@@ -30,9 +30,15 @@ Three components forming a loop:
 - `cortex init` — create ~/.cortex/ and initialize DB
 - `cortex write` — add an entry to the ledger
 - `cortex query` — semantic search across entries and distillations
-- `cortex ingest` — parse Claude Code history.jsonl, deduplicate, embed, store
+- `cortex ingest` — parse Claude Code history.jsonl, deduplicate, embed, store. Flags: `--memory`, `--subagents`, `--all`
 - `cortex distill` — cluster raw entries, sanitize, call LLM, write distillations
+- `cortex eval` — run evaluation suite. Flags: `--generate`, `--seed-qa`, `--history`
+- `cortex improve` — diagnostic tools for the eval-auditor agent. Flags: `--diagnose`, `--update-case`, `--remove-case`, `--adjust-confidence`
 - `cortex status` — show entry counts, last ingest/distill times, DB size
+
+## Agents
+
+- **eval-auditor** (`.claude/agents/eval-auditor.md`): If eval results show low relevance or precision, spawn this agent to diagnose failures, fix eval cases, add missing knowledge, and adjust confidence scores.
 
 ## Project Structure
 
