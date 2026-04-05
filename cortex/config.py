@@ -39,8 +39,8 @@ DEFAULT_TOP_K = 10  # default results for query
 # Entry types
 ENTRY_TYPES = {"raw", "observation", "recommendation", "correction", "pattern"}
 
-# Ranking weights
-SIMILARITY_WEIGHT = 0.6
-CONFIDENCE_WEIGHT = 0.25
-RECENCY_WEIGHT = 0.15
-DISTILLATION_BOOST = 0.15  # distillations are refined knowledge, rank above raw entries
+# Ranking weights — similarity must dominate to prevent confidence/recency
+# from creating a high floor score for irrelevant results
+SIMILARITY_WEIGHT = 0.75
+CONFIDENCE_WEIGHT = 0.15
+RECENCY_WEIGHT = 0.10
