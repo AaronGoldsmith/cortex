@@ -323,20 +323,31 @@ def trace(distillation_id, window):
 @click.option("--backfill-variants", is_flag=True, help="Add query variants to existing cases that lack them")
 @click.option("--compare-context", "compare_context_flag", is_flag=True, help="A/B eval: distillation quality with vs without conversation context")
 @click.option("--llm-judge", is_flag=True, help="Score results with LLM judge on relevance/faithfulness (1-5)")
-def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_context_flag, llm_judge):
+@click.option("--retire", is_flag=True, help="Auto-retire cases that have passed consistently")
+@click.option("--adversarial", is_flag=True, help="Generate adversarial eval cases using LLM")
+def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_context_flag, llm_judge, retire, adversarial):
     """Run evaluation suite against current knowledge base."""
+    from cortex.config import EVAL_CASE_HISTORY_PATH, EVAL_CASES_RETIRED_PATH
     from cortex.db import get_connection
     from cortex.eval import (
         EVAL_CASES_PATH,
         backfill_variants as do_backfill,
         compare_evals,
+        generate_adversarial_cases,
         generate_eval_cases,
+        load_case_history,
         load_eval_cases,
         load_eval_history,
+        load_retired_cases,
+        retire_stale_cases,
         run_eval,
+        save_case_history,
         save_eval_cases,
+        save_retired_cases,
         seed_qa_cases,
+        should_generate_adversarial,
         snapshot_eval,
+        update_case_history,
     )
 
     _ensure_initialized()
@@ -393,6 +404,51 @@ def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_conte
     # Auto-snapshot for trend tracking
     snapshot_eval(report)
     click.echo(f"(Snapshot saved to eval history)")
+
+    # Auto-update per-case pass/fail history (always runs)
+    case_history = load_case_history(EVAL_CASE_HISTORY_PATH)
+    update_case_history(case_history, report)
+    save_case_history(EVAL_CASE_HISTORY_PATH, case_history)
+
+    # Auto-retire stable cases (opt-in)
+    if retire:
+        active, retired = retire_stale_cases(cases, case_history)
+        if retired:
+            # Append to retired cases file
+            previously_retired = load_retired_cases(EVAL_CASES_RETIRED_PATH)
+            previously_retired.extend(retired)
+            save_retired_cases(EVAL_CASES_RETIRED_PATH, previously_retired)
+
+            # Save only active cases
+            save_eval_cases(EVAL_CASES_PATH, active)
+
+            click.echo(f"\nRetired {len(retired)} cases (passed 10+ consecutive times):")
+            for c in retired:
+                click.echo(f"  - {c.description}")
+            click.echo(f"Active cases remaining: {len(active)}")
+            click.echo(f"Retired cases saved to {EVAL_CASES_RETIRED_PATH}")
+        else:
+            click.echo("\nNo cases eligible for retirement.")
+
+    # Generate adversarial cases (opt-in)
+    if adversarial:
+        new_adversarial = generate_adversarial_cases(conn, cases)
+        if new_adversarial:
+            # Reload cases in case retirement just modified them
+            current_cases = load_eval_cases(EVAL_CASES_PATH)
+            current_cases.extend(new_adversarial)
+            save_eval_cases(EVAL_CASES_PATH, current_cases)
+
+            # Update the marker in case history
+            count_row = conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+            case_history["_last_adversarial_at_entry_count"] = count_row[0] if count_row else 0
+            save_case_history(EVAL_CASE_HISTORY_PATH, case_history)
+
+            click.echo(f"\nGenerated {len(new_adversarial)} adversarial cases:")
+            for c in new_adversarial:
+                click.echo(f"  - {c.description}")
+        else:
+            click.echo("\nNo adversarial cases generated (LLM returned no valid cases).")
 
     conn.close()
 

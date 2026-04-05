@@ -9,12 +9,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cortex.config import CORTEX_DIR
+from cortex.config import CORTEX_DIR, EVAL_CASE_HISTORY_PATH, EVAL_CASES_RETIRED_PATH
 
 logger = logging.getLogger(__name__)
 
 EVAL_CASES_PATH = CORTEX_DIR / "eval_cases.json"
 EVAL_HISTORY_PATH = CORTEX_DIR / "eval_history.jsonl"
+
+DEFAULT_RETIRE_THRESHOLD = 10
+ADVERSARIAL_ENTRY_INTERVAL = 100
 
 
 @dataclass
@@ -649,6 +652,239 @@ def backfill_variants(cases: list[EvalCase]) -> int:
             updated += 1
 
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Per-case pass/fail tracking
+# ---------------------------------------------------------------------------
+
+
+def load_case_history(path: Path = EVAL_CASE_HISTORY_PATH) -> dict:
+    """Load per-case pass/fail tracking history."""
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_case_history(path: Path, history: dict) -> None:
+    """Save per-case pass/fail tracking history."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def _case_key(case: EvalCase) -> str:
+    """Derive a stable key for a case from its description."""
+    return case.description if case.description else case.query
+
+
+def update_case_history(case_history: dict, report: EvalReport) -> dict:
+    """Update case history after an eval run.
+
+    Increments consecutive_passes for passing cases, resets to 0 for
+    failing ones. Updates total_runs and last_run for all cases.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for cr in report.case_results:
+        key = _case_key(cr.case)
+        entry = case_history.get(key, {
+            "consecutive_passes": 0,
+            "total_runs": 0,
+            "last_run": "",
+        })
+
+        entry["total_runs"] = entry.get("total_runs", 0) + 1
+        entry["last_run"] = today
+
+        if cr.relevance_hit and cr.precision >= 0.4:
+            entry["consecutive_passes"] = entry.get("consecutive_passes", 0) + 1
+        else:
+            entry["consecutive_passes"] = 0
+
+        case_history[key] = entry
+
+    return case_history
+
+
+# ---------------------------------------------------------------------------
+# Auto-retire stable cases
+# ---------------------------------------------------------------------------
+
+
+def retire_stale_cases(
+    cases: list[EvalCase],
+    case_history: dict,
+    threshold: int = DEFAULT_RETIRE_THRESHOLD,
+) -> tuple[list[EvalCase], list[EvalCase]]:
+    """Split cases into active and retired based on consecutive pass count.
+
+    Cases with consecutive_passes >= threshold are retired.
+    Returns (active_cases, retired_cases).
+    """
+    active = []
+    retired = []
+
+    for case in cases:
+        key = _case_key(case)
+        entry = case_history.get(key, {})
+        if entry.get("consecutive_passes", 0) >= threshold:
+            retired.append(case)
+        else:
+            active.append(case)
+
+    return active, retired
+
+
+def load_retired_cases(path: Path = EVAL_CASES_RETIRED_PATH) -> list[EvalCase]:
+    """Load previously retired eval cases."""
+    return load_eval_cases(path)
+
+
+def save_retired_cases(path: Path, cases: list[EvalCase]) -> None:
+    """Save retired eval cases."""
+    save_eval_cases(path, cases)
+
+
+# ---------------------------------------------------------------------------
+# Auto-generate adversarial cases
+# ---------------------------------------------------------------------------
+
+ADVERSARIAL_PROMPT = """You are generating adversarial eval cases for a knowledge retrieval system called Cortex.
+
+The system stores entries (observations, patterns, corrections) and distillations (LLM-extracted patterns) in a vector-search-enabled SQLite database. Eval cases test whether the retrieval system returns relevant results for given queries.
+
+Here are some recent entries/distillations from the database:
+{samples}
+
+Here are descriptions of existing eval cases (DO NOT duplicate these):
+{existing_descriptions}
+
+Generate {count} NEW adversarial eval cases that test HARD retrieval scenarios:
+1. Cross-project retrieval — queries that should pull results from multiple projects
+2. Negation queries — "what should I NOT do when X?" or "mistakes to avoid"
+3. Specificity tests — queries where vague results would be wrong
+4. Temporal queries — "most recent" or "latest" patterns
+5. Edge cases — very short queries, very specific technical terms
+
+Return ONLY a JSON array of objects, each with these fields:
+- "query": the search query string
+- "expected_keywords": array of keywords that SHOULD appear in good results
+- "anti_keywords": array of keywords that indicate WRONG results
+- "description": human-readable description of what this tests
+- "answer": brief expected ground truth answer
+- "query_variants": array of 2-3 paraphrased alternatives
+
+Example format:
+[
+  {{
+    "query": "fly.io deployment gotchas",
+    "expected_keywords": ["fly", "deploy", "gotcha"],
+    "anti_keywords": ["heroku", "aws"],
+    "description": "Cross-project: fly.io deployment issues across projects",
+    "answer": "Common fly.io deployment issues encountered across projects",
+    "query_variants": ["fly deployment problems", "issues deploying to fly.io"]
+  }}
+]
+
+Return ONLY the JSON array, no other text.
+"""
+
+
+def should_generate_adversarial(conn, case_history: dict) -> bool:
+    """Check if enough new entries have been added to warrant adversarial generation.
+
+    Returns True if entry count has grown by ADVERSARIAL_ENTRY_INTERVAL or more
+    since the last adversarial generation.
+    """
+    count_row = conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+    current_count = count_row[0] if count_row else 0
+
+    last_count = case_history.get("_last_adversarial_at_entry_count", 0)
+    return (current_count - last_count) >= ADVERSARIAL_ENTRY_INTERVAL
+
+
+def generate_adversarial_cases(
+    conn,
+    existing_cases: list[EvalCase],
+    count: int = 5,
+    llm_call=None,
+) -> list[EvalCase]:
+    """Generate adversarial eval cases using an LLM.
+
+    Uses the same shell-out-to-claude pattern as distill.py.
+    The llm_call parameter is injectable for testing.
+    """
+    if llm_call is None:
+        from cortex.distill import _default_llm_call
+        llm_call = _default_llm_call
+
+    # Gather sample entries/distillations for context
+    sample_rows = conn.execute(
+        "SELECT content FROM entries ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+    dist_rows = conn.execute(
+        "SELECT content FROM distillations ORDER BY created_at DESC LIMIT 10"
+    ).fetchall()
+
+    samples = []
+    for row in sample_rows:
+        content = row[0] if isinstance(row, (tuple, list)) else row["content"]
+        samples.append(f"- {content[:150]}")
+    for row in dist_rows:
+        content = row[0] if isinstance(row, (tuple, list)) else row["content"]
+        samples.append(f"- [distillation] {content[:150]}")
+
+    existing_descriptions = [
+        f"- {case.description}" for case in existing_cases if case.description
+    ]
+
+    prompt = ADVERSARIAL_PROMPT.format(
+        samples="\n".join(samples[:20]),
+        existing_descriptions="\n".join(existing_descriptions[:30]),
+        count=count,
+    )
+
+    response = llm_call(prompt)
+
+    # Parse JSON from response
+    return _parse_adversarial_response(response)
+
+
+def _parse_adversarial_response(response: str) -> list[EvalCase]:
+    """Parse LLM response into EvalCase objects."""
+    # Try to extract JSON array from response
+    text = response.strip()
+
+    # Find JSON array boundaries
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1:
+        return []
+
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return []
+
+    cases = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            cases.append(EvalCase(
+                query=item["query"],
+                expected_keywords=item.get("expected_keywords", []),
+                anti_keywords=item.get("anti_keywords", []),
+                description=item.get("description", item["query"]),
+                answer=item.get("answer", ""),
+                query_variants=item.get("query_variants", []),
+            ))
+        except (KeyError, TypeError):
+            continue
+
+    return cases
 
 
 # ---------------------------------------------------------------------------
