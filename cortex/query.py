@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from cortex.config import (
     CONFIDENCE_WEIGHT,
     DEFAULT_TOP_K,
-    DISTILLATION_BOOST,
     PROJECTS_DIR,
     RECENCY_WEIGHT,
     SIMILARITY_WEIGHT,
@@ -18,31 +17,21 @@ from cortex.embedder import embed_query
 log = logging.getLogger(__name__)
 
 
-def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None):
-    """Search the ledger for entries and distillations relevant to the query text.
+def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None, include_raw=False):
+    """Search the ledger for relevant knowledge.
+
+    By default searches distillations only (refined knowledge). Raw entries
+    are noisy user messages — use include_raw=True or `cortex trace` for lineage.
 
     Returns a ranked list of results combining semantic similarity,
     confidence, and recency.
     """
     query_embedding = embed_query(text)
 
-    # Search both entries and distillations
-    entry_hits = vector_search(conn, query_embedding, "entry_vec", top_k * 2)
-    distill_hits = vector_search(conn, query_embedding, "distill_vec", top_k * 2)
-
     results = []
 
-    # Fetch entry details
-    for entry_id, distance in entry_hits:
-        row = conn.execute(
-            "SELECT id, content, entry_type, source_model, source_project, "
-            "confidence, created_at FROM entries WHERE id = ?",
-            (entry_id,),
-        ).fetchone()
-        if row and (project_filter is None or row[4] == project_filter):
-            results.append(_score_result(row, distance, kind="entry"))
-
-    # Fetch distillation details with source context
+    # Always search distillations — these are the knowledge
+    distill_hits = vector_search(conn, query_embedding, "distill_vec", top_k * 2)
     for dist_id, distance in distill_hits:
         row = conn.execute(
             "SELECT id, content, pattern_type, source_model, NULL, "
@@ -53,6 +42,18 @@ def query(conn, text, top_k=DEFAULT_TOP_K, project_filter=None):
             result = _score_result(row, distance, kind="distillation")
             result["source_context"] = _get_source_context(conn, dist_id, row[7] or 0)
             results.append(result)
+
+    # Optionally include raw entries (for backwards compat / debugging)
+    if include_raw:
+        entry_hits = vector_search(conn, query_embedding, "entry_vec", top_k * 2)
+        for entry_id, distance in entry_hits:
+            row = conn.execute(
+                "SELECT id, content, entry_type, source_model, source_project, "
+                "confidence, created_at FROM entries WHERE id = ?",
+                (entry_id,),
+            ).fetchone()
+            if row and (project_filter is None or row[4] == project_filter):
+                results.append(_score_result(row, distance, kind="entry"))
 
     # Sort by combined score descending
     results.sort(key=lambda r: r["score"], reverse=True)
@@ -77,7 +78,6 @@ def _score_result(row, distance, kind):
         SIMILARITY_WEIGHT * similarity
         + CONFIDENCE_WEIGHT * confidence
         + RECENCY_WEIGHT * recency
-        + (DISTILLATION_BOOST if kind == "distillation" else 0.0)
     )
 
     return {

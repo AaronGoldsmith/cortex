@@ -143,7 +143,7 @@ def test_semantic_relevance(db):
         insert_entry(db, content=text, entry_type="raw", embedding=embed(text))
 
     # Query for React-related topic
-    react_results = query(db, "React hooks and component lifecycle", top_k=6)
+    react_results = query(db, "React hooks and component lifecycle", top_k=6, include_raw=True)
     assert len(react_results) >= 3, "Should return enough results to compare ranking"
 
     # Top results should be React entries
@@ -155,7 +155,7 @@ def test_semantic_relevance(db):
     )
 
     # Query for SQL-related topic
-    sql_results = query(db, "database performance and query optimization", top_k=6)
+    sql_results = query(db, "database performance and query optimization", top_k=6, include_raw=True)
     assert len(sql_results) >= 3, "Should return enough results to compare ranking"
 
     top_3_contents = [r["content"] for r in sql_results[:3]]

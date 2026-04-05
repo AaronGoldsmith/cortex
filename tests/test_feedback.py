@@ -198,7 +198,7 @@ def test_format_results_includes_feedback_hint(db):
     content = "Use virtual environments for Python projects."
     insert_entry(db, content=content, entry_type="raw", embedding=embed(content))
 
-    results = query(db, "Python virtual environments", top_k=3)
+    results = query(db, "Python virtual environments", top_k=3, include_raw=True)
     output = format_results(results)
     assert "cortex feedback" in output
     assert "yes/no" in output
