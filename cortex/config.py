@@ -43,3 +43,4 @@ ENTRY_TYPES = {"raw", "observation", "recommendation", "correction", "pattern"}
 SIMILARITY_WEIGHT = 0.6
 CONFIDENCE_WEIGHT = 0.25
 RECENCY_WEIGHT = 0.15
+DISTILLATION_BOOST = 0.15  # distillations are refined knowledge, rank above raw entries
