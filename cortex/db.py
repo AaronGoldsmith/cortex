@@ -216,6 +216,163 @@ def mark_entries_distilled(conn: sqlite3.Connection, entry_ids: list[int]) -> No
     conn.commit()
 
 
+def record_feedback(
+    conn: sqlite3.Connection,
+    entry_id: int = None,
+    distillation_id: int = None,
+    helpful: bool = True,
+    context: str = None,
+) -> int:
+    """Insert a feedback row. Returns the feedback id.
+
+    Validates that the referenced entry/distillation exists.
+    Prevents duplicate feedback for the same (entry/distillation, context) combo.
+    """
+    if entry_id is None and distillation_id is None:
+        raise ValueError("Must provide either entry_id or distillation_id")
+
+    # Validate existence
+    if entry_id is not None:
+        row = conn.execute("SELECT id FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Entry {entry_id} not found")
+
+    if distillation_id is not None:
+        row = conn.execute("SELECT id FROM distillations WHERE id = ?", (distillation_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Distillation {distillation_id} not found")
+
+    # Check for duplicate feedback (same target + same context)
+    existing = conn.execute(
+        "SELECT id FROM feedback WHERE entry_id IS ? AND distillation_id IS ? AND context IS ?",
+        (entry_id, distillation_id, context),
+    ).fetchone()
+    if existing:
+        raise ValueError("Duplicate feedback already recorded for this item and context")
+
+    cur = conn.execute(
+        "INSERT INTO feedback (entry_id, distillation_id, helpful, context) VALUES (?, ?, ?, ?)",
+        (entry_id, distillation_id, 1 if helpful else 0, context),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def adjust_confidence_from_feedback(
+    conn: sqlite3.Connection,
+    entry_id: int = None,
+    distillation_id: int = None,
+    helpful: bool = True,
+) -> Optional[float]:
+    """Adjust confidence of an entry or distillation based on feedback.
+
+    Each 'helpful' bumps confidence by +0.05 (capped at 2.0).
+    Each 'not helpful' reduces confidence by -0.1 (floored at 0.1).
+    Returns the new confidence value.
+    """
+    if entry_id is not None:
+        table = "entries"
+        item_id = entry_id
+    elif distillation_id is not None:
+        table = "distillations"
+        item_id = distillation_id
+    else:
+        return None
+
+    row = conn.execute(f"SELECT confidence FROM {table} WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        return None
+
+    current = row[0] or 1.0
+    if helpful:
+        new_conf = min(2.0, current + 0.05)
+    else:
+        new_conf = max(0.1, current - 0.1)
+
+    new_conf = round(new_conf, 4)
+    conn.execute(f"UPDATE {table} SET confidence = ? WHERE id = ?", (new_conf, item_id))
+    conn.commit()
+    return new_conf
+
+
+def get_feedback_stats(conn: sqlite3.Connection) -> dict:
+    """Return aggregate feedback statistics."""
+    total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+    helpful_count = conn.execute("SELECT COUNT(*) FROM feedback WHERE helpful = 1").fetchone()[0]
+
+    helpful_rate = (helpful_count / total * 100) if total > 0 else 0.0
+
+    # Top 5 most-helpful entries/distillations
+    top_helpful = conn.execute("""
+        SELECT entry_id, distillation_id, SUM(helpful) as helpful_sum, COUNT(*) as total
+        FROM feedback
+        GROUP BY entry_id, distillation_id
+        ORDER BY helpful_sum DESC
+        LIMIT 5
+    """).fetchall()
+
+    # Top 5 least-helpful (most "no" feedback)
+    top_unhelpful = conn.execute("""
+        SELECT entry_id, distillation_id,
+               SUM(CASE WHEN helpful = 0 THEN 1 ELSE 0 END) as unhelpful_sum,
+               COUNT(*) as total
+        FROM feedback
+        GROUP BY entry_id, distillation_id
+        ORDER BY unhelpful_sum DESC
+        LIMIT 5
+    """).fetchall()
+
+    # Breakdown by entry type / pattern type
+    entry_breakdown = conn.execute("""
+        SELECT e.entry_type, COUNT(*) as cnt,
+               SUM(f.helpful) as helpful_sum
+        FROM feedback f
+        JOIN entries e ON f.entry_id = e.id
+        WHERE f.entry_id IS NOT NULL
+        GROUP BY e.entry_type
+    """).fetchall()
+
+    pattern_breakdown = conn.execute("""
+        SELECT d.pattern_type, COUNT(*) as cnt,
+               SUM(f.helpful) as helpful_sum
+        FROM feedback f
+        JOIN distillations d ON f.distillation_id = d.id
+        WHERE f.distillation_id IS NOT NULL
+        GROUP BY d.pattern_type
+    """).fetchall()
+
+    return {
+        "total": total,
+        "helpful_count": helpful_count,
+        "unhelpful_count": total - helpful_count,
+        "helpful_rate": round(helpful_rate, 1),
+        "top_helpful": [
+            {
+                "id": f"D{r[1]}" if r[1] else f"E{r[0]}",
+                "helpful": r[2],
+                "total": r[3],
+            }
+            for r in top_helpful
+        ],
+        "top_unhelpful": [
+            {
+                "id": f"D{r[1]}" if r[1] else f"E{r[0]}",
+                "unhelpful": r[2],
+                "total": r[3],
+            }
+            for r in top_unhelpful
+        ],
+        "entry_type_breakdown": [
+            {"type": r[0], "count": r[1], "helpful": r[2]}
+            for r in entry_breakdown
+        ],
+        "pattern_type_breakdown": [
+            {"type": r[0], "count": r[1], "helpful": r[2]}
+            for r in pattern_breakdown
+        ],
+    }
+
+
 def vector_search(
     conn: sqlite3.Connection,
     embedding: list[float],
