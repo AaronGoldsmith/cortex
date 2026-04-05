@@ -1,5 +1,7 @@
 """Cortex configuration — paths, model version, constants."""
 
+import os
+import platform
 from pathlib import Path
 
 # Paths
@@ -17,6 +19,13 @@ EMBEDDING_DIM = 384
 CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_PATH = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Goose
+if platform.system() == "Windows":
+    _appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    GOOSE_DB_PATH = _appdata / "Block" / "goose" / "data" / "sessions" / "sessions.db"
+else:
+    GOOSE_DB_PATH = Path.home() / ".local" / "share" / "goose" / "sessions" / "sessions.db"
 
 # Distillation
 DEFAULT_CLUSTER_MIN = 2  # minimum entries to form a cluster

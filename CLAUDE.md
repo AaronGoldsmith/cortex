@@ -31,7 +31,7 @@ Three components forming a loop:
 - `cortex init` — create ~/.cortex/ and initialize DB
 - `cortex write` — add an entry to the ledger
 - `cortex query` — semantic search across entries and distillations
-- `cortex ingest` — parse Claude Code history.jsonl, deduplicate, embed, store. Flags: `--memory`, `--subagents`, `--all`, `--backfill-turns`
+- `cortex ingest` — ingest session history from AI tools. Flags: `--source` (claude|goose|all), `--memory`, `--subagents`, `--all`, `--backfill-turns`
 - `cortex distill` — cluster raw entries, sanitize, call LLM, write distillations. Flags: `--context-window N`
 - `cortex eval` — run evaluation suite. Flags: `--generate`, `--seed-qa`, `--history`
 - `cortex improve` — diagnostic tools for the eval-auditor agent. Flags: `--diagnose`, `--update-case`, `--remove-case`, `--adjust-confidence`
@@ -51,18 +51,21 @@ cortex/
   config.py     — Paths, model version, constants
   db.py         — Schema, migrations, connection management
   embedder.py   — sentence-transformers wrapper
-  ingest.py     — history.jsonl parser + dedup
+  ingest.py     — Orchestrator + Claude-specific memory/subagent ingest
   distill.py    — Clustering, sanitization, LLM calls, write-back
   query.py      — Vector search + ranking
   sanitize.py   — Secret detection/redaction before LLM calls
   sessions.py   — Runtime conversation context loader from session JSONL files
+  providers/
+    __init__.py  — Provider registry (get_provider, discover_providers)
+    base.py      — IngestEntry NamedTuple + IngestProvider Protocol
+    claude.py    — Claude Code history.jsonl provider
+    goose.py     — Goose (Block) sessions.db provider
 tests/
-  test_db.py
-  test_embedder.py
-  test_ingest.py
-  test_distill.py
-  test_query.py
-  test_sanitize.py
+  test_core_loop.py
+  test_eval.py
+  test_providers.py
+  test_sessions.py
 ```
 
 ## Testing

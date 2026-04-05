@@ -1,4 +1,4 @@
-"""Ingestion — parses Claude Code history, memory files, and subagent logs into the Cortex ledger."""
+"""Ingestion — parses AI tool session history, memory files, and subagent logs into the Cortex ledger."""
 
 import json
 import logging
@@ -7,11 +7,9 @@ from pathlib import Path
 
 from cortex.db import insert_entry
 from cortex.embedder import embed
+from cortex.providers.base import IngestEntry
 
 log = logging.getLogger(__name__)
-
-# Cache for session turn lookups within a single ingest run
-_session_turn_cache: dict[str, list] = {}
 
 # Map memory file frontmatter types to Cortex entry types
 _MEMORY_TYPE_MAP = {
@@ -22,94 +20,47 @@ _MEMORY_TYPE_MAP = {
 }
 
 
-def _load_state(state_path: Path) -> dict:
-    """Load cursor state from disk, or return defaults for first run."""
-    try:
-        return json.loads(state_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"last_line": 0, "last_session_id": None, "file_size": 0}
-
-
-def _save_state(state_path: Path, state: dict) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state))
+def run_provider_ingest(conn, provider) -> dict:
+    """Generic ingest loop: iterate provider entries, embed, insert, return stats."""
+    stats = {"ingested": 0, "skipped": 0, "errors": 0}
+    for entry in provider.iter_entries(conn):
+        try:
+            embedding = embed(entry.content)
+            result = insert_entry(
+                conn,
+                content=entry.content,
+                entry_type=entry.entry_type,
+                source_model=entry.source_model,
+                source_project=entry.source_project,
+                session_id=entry.session_id,
+                confidence=entry.confidence,
+                embedding=embedding,
+                turn_index=entry.turn_index,
+            )
+            if result is None:
+                stats["skipped"] += 1
+            else:
+                stats["ingested"] += 1
+        except Exception as e:
+            log.warning("Error ingesting entry: %s", e)
+            stats["errors"] += 1
+    return stats
 
 
 def ingest_history(conn, history_path: Path, state_path: Path, projects_dir: Path = None) -> dict:
     """Ingest new lines from history.jsonl into the ledger.
 
-    If projects_dir is provided, resolves turn_index for each entry by looking
-    up its position in the corresponding session JSONL file.
-
+    Backward-compatible facade — delegates to ClaudeHistoryProvider.
     Returns dict with keys: ingested, skipped, errors.
     """
-    history_path = Path(history_path)
-    state_path = Path(state_path)
+    from cortex.providers.claude import ClaudeHistoryProvider
 
-    if not history_path.exists():
-        raise FileNotFoundError(
-            f"History file not found: {history_path}. "
-            "Is Claude Code installed? Expected at ~/.claude/history.jsonl"
-        )
-
-    state = _load_state(state_path)
-    file_size = history_path.stat().st_size
-
-    # Detect file rotation (size shrank)
-    if file_size < state.get("file_size", 0):
-        log.info("History file shrank (%d -> %d), resetting cursor", state["file_size"], file_size)
-        state["last_line"] = 0
-
-    stats = {"ingested": 0, "skipped": 0, "errors": 0}
-    last_line = state["last_line"]
-
-    with open(history_path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f):
-            if line_no < last_line:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                log.warning("Malformed JSON at line %d, skipping", line_no)
-                stats["errors"] += 1
-                continue
-
-            content = entry.get("display", "")
-            if not content or len(content) < 10:
-                stats["skipped"] += 1
-                continue
-
-            session_id = entry.get("sessionId")
-            turn_index = None
-            if projects_dir and session_id:
-                turn_index = _resolve_turn_index(session_id, content, projects_dir)
-
-            embedding = embed(content)
-            result = insert_entry(
-                conn,
-                content=content,
-                entry_type="raw",
-                source_model="claude",
-                source_project=entry.get("project"),
-                session_id=session_id,
-                confidence=1.0,
-                embedding=embedding,
-                turn_index=turn_index,
-            )
-            if result is None:
-                stats["skipped"] += 1  # duplicate
-            else:
-                stats["ingested"] += 1
-            state["last_session_id"] = session_id
-            last_line = line_no + 1
-
-    state["last_line"] = last_line
-    state["file_size"] = file_size
-    _save_state(state_path, state)
-    return stats
+    provider = ClaudeHistoryProvider(
+        history_path=history_path,
+        state_path=state_path,
+        projects_dir=projects_dir,
+    )
+    return run_provider_ingest(conn, provider)
 
 
 def _parse_memory_frontmatter(text):
@@ -284,40 +235,13 @@ def ingest_subagent_logs(conn, projects_dir: Path) -> dict:
     return stats
 
 
-def _resolve_turn_index(session_id: str, content: str, projects_dir: Path) -> int | None:
-    """Find the turn index of a user message within its session JSONL.
-
-    Uses the sessions module to parse turns, then matches by content.
-    Results are cached per session_id within the process.
-    """
-    if session_id in _session_turn_cache:
-        turns = _session_turn_cache[session_id]
-    else:
-        from cortex.sessions import find_session_file, read_session_turns
-
-        session_path = find_session_file(session_id, projects_dir)
-        if session_path is None:
-            _session_turn_cache[session_id] = []
-            return None
-        turns = read_session_turns(session_path)
-        _session_turn_cache[session_id] = turns
-
-    # Match by content prefix (history.jsonl display may be truncated)
-    content_stripped = content.strip()
-    for turn in turns:
-        if turn.user_text == content_stripped:
-            return turn.index
-        # Fallback: prefix match for truncated content
-        if len(content_stripped) > 50 and turn.user_text.startswith(content_stripped[:50]):
-            return turn.index
-    return None
-
-
 def backfill_turn_indices(conn, projects_dir: Path) -> dict:
     """Backfill turn_index for existing entries that have session_id but no turn_index.
 
     Returns dict with keys: updated, skipped.
     """
+    from cortex.providers.claude import _resolve_turn_index, _session_turn_cache
+
     rows = conn.execute(
         "SELECT id, content, session_id FROM entries "
         "WHERE session_id IS NOT NULL AND turn_index IS NULL"

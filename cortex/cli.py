@@ -83,13 +83,15 @@ def query(text, top_k, project):
 
 
 @main.command()
+@click.option("--source", type=click.Choice(["claude", "goose", "all"]), default="claude",
+              help="Data source to ingest from (default: claude)")
 @click.option("--background", is_flag=True, help="Run in background (for hooks)")
 @click.option("--memory", is_flag=True, help="Also ingest .claude/projects/*/memory/*.md files")
 @click.option("--subagents", is_flag=True, help="Also ingest subagent conversation logs")
-@click.option("--all", "ingest_all", is_flag=True, help="Ingest all sources (history + memory + subagents)")
+@click.option("--all", "ingest_all", is_flag=True, help="Ingest all sub-sources for the selected provider")
 @click.option("--backfill-turns", is_flag=True, help="Populate turn_index on existing entries by matching them to session JSONL files")
-def ingest(background, memory, subagents, ingest_all, backfill_turns):
-    """Ingest Claude Code session history into the ledger."""
+def ingest(source, background, memory, subagents, ingest_all, backfill_turns):
+    """Ingest AI tool session history into the ledger."""
     if background:
         # Spawn self as background process
         click.echo("cortex: ingesting session...", err=True)
@@ -103,7 +105,8 @@ def ingest(background, memory, subagents, ingest_all, backfill_turns):
 
     from cortex.config import PROJECTS_DIR
     from cortex.db import get_connection
-    from cortex.ingest import backfill_turn_indices, ingest_history, ingest_memory_files, ingest_subagent_logs
+    from cortex.ingest import backfill_turn_indices, ingest_history, ingest_memory_files, ingest_subagent_logs, run_provider_ingest
+    from cortex.providers import discover_providers, get_provider
 
     _ensure_initialized()
     conn = get_connection(DB_PATH)
@@ -111,34 +114,61 @@ def ingest(background, memory, subagents, ingest_all, backfill_turns):
         if backfill_turns:
             bstats = backfill_turn_indices(conn, PROJECTS_DIR)
             click.echo(
-                f"Backfill — Updated: {bstats['updated']}, "
+                f"Backfill -- Updated: {bstats['updated']}, "
                 f"Skipped: {bstats['skipped']}"
             )
             return
 
-        # Always ingest main history (now with turn_index resolution)
-        stats = ingest_history(conn, HISTORY_PATH, STATE_PATH, projects_dir=PROJECTS_DIR)
-        click.echo(
-            f"History — Ingested: {stats['ingested']}, "
-            f"Skipped: {stats['skipped']}, "
-            f"Errors: {stats['errors']}"
-        )
+        # Warn if Claude-specific flags used with non-Claude source
+        if source not in ("claude", "all") and (memory or subagents):
+            click.echo(f"Warning: --memory/--subagents only apply to Claude source, ignoring", err=True)
 
-        if memory or ingest_all:
-            mstats = ingest_memory_files(conn, PROJECTS_DIR)
-            click.echo(
-                f"Memory  — Ingested: {mstats['ingested']}, "
-                f"Skipped: {mstats['skipped']}, "
-                f"Errors: {mstats['errors']}"
-            )
+        # Determine which providers to run
+        if source == "all":
+            sources = discover_providers()
+            if not sources:
+                click.echo("No providers detected on this machine.", err=True)
+                sys.exit(1)
+        else:
+            sources = [source]
 
-        if subagents or ingest_all:
-            sstats = ingest_subagent_logs(conn, PROJECTS_DIR)
-            click.echo(
-                f"Agents  — Ingested: {sstats['ingested']}, "
-                f"Skipped: {sstats['skipped']}, "
-                f"Errors: {sstats['errors']}"
-            )
+        for src in sources:
+            if src == "claude":
+                # Claude uses the facade for backward compat (state file, turn resolution)
+                stats = ingest_history(conn, HISTORY_PATH, STATE_PATH, projects_dir=PROJECTS_DIR)
+                click.echo(
+                    f"Claude  -- Ingested: {stats['ingested']}, "
+                    f"Skipped: {stats['skipped']}, "
+                    f"Errors: {stats['errors']}"
+                )
+
+                if memory or ingest_all:
+                    mstats = ingest_memory_files(conn, PROJECTS_DIR)
+                    click.echo(
+                        f"Memory  -- Ingested: {mstats['ingested']}, "
+                        f"Skipped: {mstats['skipped']}, "
+                        f"Errors: {mstats['errors']}"
+                    )
+
+                if subagents or ingest_all:
+                    sstats = ingest_subagent_logs(conn, PROJECTS_DIR)
+                    click.echo(
+                        f"Agents  -- Ingested: {sstats['ingested']}, "
+                        f"Skipped: {sstats['skipped']}, "
+                        f"Errors: {sstats['errors']}"
+                    )
+            else:
+                provider = get_provider(src)
+                if not provider.detect():
+                    click.echo(f"{src.title()} -- not detected, skipping")
+                    continue
+                stats = run_provider_ingest(conn, provider)
+                label = src.title().ljust(7)
+                click.echo(
+                    f"{label}-- Ingested: {stats['ingested']}, "
+                    f"Skipped: {stats['skipped']}, "
+                    f"Errors: {stats['errors']}"
+                )
 
     except FileNotFoundError as e:
         click.echo(f"Error: {e}", err=True)
