@@ -12,6 +12,8 @@ from cortex.eval import (
     EvalReport,
     _content_matches_any,
     _eval_single,
+    _parse_judge_response,
+    llm_judge_eval,
     load_eval_cases,
     run_eval,
     save_eval_cases,
@@ -270,3 +272,176 @@ def test_run_eval_produces_report(sample_cases):
     assert "UTC" in report.timestamp
     # query was called once per case
     assert mock_query.call_count == 2
+
+
+# --- Test LLM judge response parsing ---
+
+
+def test_parse_judge_response_valid():
+    """Parses well-formed LLM judge JSON correctly."""
+    response = json.dumps({
+        "scores": [
+            {"result_index": 0, "relevance": 4, "faithfulness": 5, "reasoning": "Directly relevant"},
+            {"result_index": 1, "relevance": 2, "faithfulness": 3, "reasoning": "Partially related"},
+        ]
+    })
+    scores = _parse_judge_response(response)
+    assert len(scores) == 2
+    assert scores[0]["relevance"] == 4
+    assert scores[0]["faithfulness"] == 5
+    assert scores[1]["relevance"] == 2
+    assert scores[1]["faithfulness"] == 3
+
+
+def test_parse_judge_response_with_surrounding_text():
+    """Parses JSON even when wrapped in extra text."""
+    response = 'Here is the scoring:\n{"scores": [{"result_index": 0, "relevance": 3, "faithfulness": 4, "reasoning": "ok"}]}\nDone.'
+    scores = _parse_judge_response(response)
+    assert len(scores) == 1
+    assert scores[0]["relevance"] == 3
+
+
+def test_parse_judge_response_clamps_values():
+    """Values outside 1-5 are clamped."""
+    response = json.dumps({
+        "scores": [
+            {"result_index": 0, "relevance": 0, "faithfulness": 7, "reasoning": ""},
+        ]
+    })
+    scores = _parse_judge_response(response)
+    assert scores[0]["relevance"] == 1
+    assert scores[0]["faithfulness"] == 5
+
+
+def test_parse_judge_response_invalid_json():
+    """Returns empty list on garbage input."""
+    assert _parse_judge_response("not json at all") == []
+
+
+def test_parse_judge_response_missing_fields():
+    """Skips entries missing relevance or faithfulness."""
+    response = json.dumps({
+        "scores": [
+            {"result_index": 0, "relevance": 4},  # no faithfulness
+            {"result_index": 1, "relevance": 3, "faithfulness": 5, "reasoning": "ok"},
+        ]
+    })
+    scores = _parse_judge_response(response)
+    assert len(scores) == 1
+    assert scores[0]["relevance"] == 3
+
+
+# --- Test llm_judge_eval ---
+
+
+def test_llm_judge_eval_with_mock():
+    """llm_judge_eval returns averaged scores from mock LLM call."""
+    mock_response = json.dumps({
+        "scores": [
+            {"result_index": 0, "relevance": 5, "faithfulness": 4, "reasoning": "good"},
+            {"result_index": 1, "relevance": 3, "faithfulness": 4, "reasoning": "ok"},
+        ]
+    })
+    results = _make_results(["result one", "result two"])
+
+    rel, faith = llm_judge_eval("test query", results, llm_call=lambda _: mock_response)
+
+    assert rel == pytest.approx(4.0)
+    assert faith == pytest.approx(4.0)
+
+
+def test_llm_judge_eval_empty_results():
+    """Returns None, None for empty results."""
+    rel, faith = llm_judge_eval("test", [], llm_call=lambda _: "")
+    assert rel is None
+    assert faith is None
+
+
+def test_llm_judge_eval_handles_failure():
+    """Returns None, None when LLM call raises."""
+    def failing_call(prompt):
+        raise RuntimeError("LLM down")
+
+    rel, faith = llm_judge_eval("test", _make_results(["x"]), llm_call=failing_call)
+    assert rel is None
+    assert faith is None
+
+
+def test_llm_judge_eval_includes_answer_in_prompt():
+    """When answer is provided, it appears in the prompt sent to LLM."""
+    captured = {}
+    def capture_call(prompt):
+        captured["prompt"] = prompt
+        return json.dumps({"scores": [{"result_index": 0, "relevance": 4, "faithfulness": 5, "reasoning": ""}]})
+
+    llm_judge_eval("query", _make_results(["x"]), answer="the real answer", llm_call=capture_call)
+    assert "the real answer" in captured["prompt"]
+
+
+# --- Test run_eval with LLM judge ---
+
+
+def test_run_eval_with_llm_judge(sample_cases):
+    """run_eval with llm_judge=True populates LLM scores on case results."""
+    mock_results = _make_results([
+        "Always use pytest for testing Python applications",
+        "Testing with pytest fixtures simplifies setup",
+    ])
+
+    mock_judge_response = json.dumps({
+        "scores": [
+            {"result_index": 0, "relevance": 5, "faithfulness": 5, "reasoning": "perfect"},
+            {"result_index": 1, "relevance": 4, "faithfulness": 4, "reasoning": "good"},
+        ]
+    })
+
+    with patch("cortex.query.query", return_value=mock_results):
+        report = run_eval(
+            "fake_conn", sample_cases, top_k=2,
+            llm_judge=True, llm_call=lambda _: mock_judge_response,
+        )
+
+    assert report.avg_llm_relevance is not None
+    assert report.avg_llm_faithfulness is not None
+    assert report.avg_llm_relevance == pytest.approx(4.5)
+    assert report.avg_llm_faithfulness == pytest.approx(4.5)
+    # Each case result should have LLM scores
+    for cr in report.case_results:
+        assert cr.llm_relevance is not None
+        assert cr.llm_faithfulness is not None
+
+
+def test_run_eval_without_llm_judge_has_no_llm_scores(sample_cases):
+    """run_eval without llm_judge leaves LLM fields as None."""
+    mock_results = _make_results(["some content"])
+
+    with patch("cortex.query.query", return_value=mock_results):
+        report = run_eval("fake_conn", sample_cases, top_k=1)
+
+    assert report.avg_llm_relevance is None
+    assert report.avg_llm_faithfulness is None
+    for cr in report.case_results:
+        assert cr.llm_relevance is None
+        assert cr.llm_faithfulness is None
+
+
+def test_report_summary_includes_llm_scores():
+    """Summary output includes LLM scores when present."""
+    cr = CaseResult(
+        case=EvalCase(query="q", expected_keywords=["k"], anti_keywords=[], description="test"),
+        relevance_hit=True, precision=0.8, noise=0.0,
+        top_result_preview="preview",
+        llm_relevance=4.2, llm_faithfulness=3.8,
+    )
+    report = EvalReport(
+        timestamp="2025-06-01 12:00:00 UTC",
+        total_cases=1,
+        avg_relevance=1.0, avg_precision=0.8, avg_noise=0.0,
+        case_results=[cr],
+        avg_llm_relevance=4.2, avg_llm_faithfulness=3.8,
+    )
+    summary = report.summary()
+    assert "LLM Relevance:    4.20/5" in summary
+    assert "LLM Faithfulness: 3.80/5" in summary
+    assert "llm_rel=4.2" in summary
+    assert "llm_faith=3.8" in summary

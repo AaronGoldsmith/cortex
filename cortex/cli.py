@@ -322,7 +322,8 @@ def trace(distillation_id, window):
 @click.option("--history", is_flag=True, help="Show eval trend over time")
 @click.option("--backfill-variants", is_flag=True, help="Add query variants to existing cases that lack them")
 @click.option("--compare-context", "compare_context_flag", is_flag=True, help="A/B eval: distillation quality with vs without conversation context")
-def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_context_flag):
+@click.option("--llm-judge", is_flag=True, help="Score results with LLM judge on relevance/faithfulness (1-5)")
+def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_context_flag, llm_judge):
     """Run evaluation suite against current knowledge base."""
     from cortex.db import get_connection
     from cortex.eval import (
@@ -386,7 +387,7 @@ def run_eval(generate, seed_qa, top_k, history, backfill_variants, compare_conte
         save_eval_cases(EVAL_CASES_PATH, cases)
         click.echo(f"Backfilled variants on {count} cases")
 
-    report = run_eval(conn, cases, top_k=top_k)
+    report = run_eval(conn, cases, top_k=top_k, llm_judge=llm_judge)
     click.echo(report.summary())
 
     # Auto-snapshot for trend tracking

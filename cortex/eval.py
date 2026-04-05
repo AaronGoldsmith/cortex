@@ -1,12 +1,17 @@
 """Cortex eval — measure whether knowledge retrieval is improving over time."""
 
 import json
+import logging
 import random
+import shutil
+import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cortex.config import CORTEX_DIR
+
+logger = logging.getLogger(__name__)
 
 EVAL_CASES_PATH = CORTEX_DIR / "eval_cases.json"
 EVAL_HISTORY_PATH = CORTEX_DIR / "eval_history.jsonl"
@@ -35,6 +40,8 @@ class CaseResult:
     precision: float  # what fraction of results were relevant?
     noise: float  # what fraction matched anti-keywords?
     top_result_preview: str  # first result content truncated
+    llm_relevance: float | None = None  # avg LLM relevance score (1-5) across results
+    llm_faithfulness: float | None = None  # avg LLM faithfulness score (1-5) across results
 
 
 @dataclass
@@ -45,6 +52,8 @@ class EvalReport:
     avg_precision: float  # 0-1, fraction of results containing expected keywords
     avg_noise: float  # 0-1, fraction of results matching anti-keywords (lower=better)
     case_results: list[CaseResult] = field(default_factory=list)
+    avg_llm_relevance: float | None = None  # avg LLM relevance score (1-5)
+    avg_llm_faithfulness: float | None = None  # avg LLM faithfulness score (1-5)
 
     def summary(self) -> str:
         """Format as CLI-friendly summary."""
@@ -54,14 +63,22 @@ class EvalReport:
             f"  Relevance:  {self.avg_relevance:.1%}",
             f"  Precision:  {self.avg_precision:.1%}",
             f"  Noise:      {self.avg_noise:.1%}  (lower is better)",
-            "",
         ]
+        if self.avg_llm_relevance is not None:
+            lines.append(f"  LLM Relevance:    {self.avg_llm_relevance:.2f}/5")
+        if self.avg_llm_faithfulness is not None:
+            lines.append(f"  LLM Faithfulness: {self.avg_llm_faithfulness:.2f}/5")
+        lines.append("")
+
         for cr in self.case_results:
             status = "PASS" if cr.relevance_hit else "FAIL"
             lines.append(f"  [{status}] {cr.case.description}")
-            lines.append(
-                f"         precision={cr.precision:.0%}  noise={cr.noise:.0%}"
-            )
+            score_parts = f"precision={cr.precision:.0%}  noise={cr.noise:.0%}"
+            if cr.llm_relevance is not None:
+                score_parts += f"  llm_rel={cr.llm_relevance:.1f}"
+            if cr.llm_faithfulness is not None:
+                score_parts += f"  llm_faith={cr.llm_faithfulness:.1f}"
+            lines.append(f"         {score_parts}")
             if cr.top_result_preview:
                 preview = cr.top_result_preview
                 if len(preview) > 80:
@@ -136,25 +153,163 @@ def _eval_single(results: list[dict], case: EvalCase) -> CaseResult:
     )
 
 
-def run_eval(conn, cases: list[EvalCase], top_k: int = 5) -> EvalReport:
+LLM_JUDGE_PROMPT = """You are a retrieval quality judge. Given a query and a list of retrieved results, score each result on two dimensions (1-5 scale):
+
+- Relevance: Does the result answer or relate to the query?
+  1 = Completely irrelevant
+  3 = Tangentially related
+  5 = Directly answers the query
+
+- Faithfulness: Is the result grounded in actual knowledge (not hallucinated)?
+  1 = Appears fabricated
+  3 = Partially supported
+  5 = Well-grounded with clear provenance
+
+Query: {query}
+{reference_answer}
+Results:
+{results}
+
+Respond with ONLY a JSON object (no markdown fencing):
+{{"scores": [{{"result_index": 0, "relevance": N, "faithfulness": N, "reasoning": "..."}}, ...]}}
+"""
+
+
+def _llm_judge_call(prompt: str) -> str:
+    """Call Claude CLI for LLM judge scoring."""
+    if shutil.which("claude") is None:
+        raise RuntimeError("Claude Code CLI not found on PATH.")
+    result = subprocess.run(
+        ["claude", "-p", prompt],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude CLI failed: {result.stderr}")
+    return result.stdout
+
+
+def _parse_judge_response(response: str) -> list[dict]:
+    """Parse LLM judge JSON response into a list of score dicts.
+
+    Each dict has: result_index, relevance, faithfulness, reasoning.
+    Returns empty list on parse failure.
+    """
+    text = response.strip()
+    # Try to extract JSON object if wrapped in other text
+    try:
+        if not text.startswith("{"):
+            start = text.index("{")
+            end = text.rindex("}") + 1
+            text = text[start:end]
+        data = json.loads(text)
+        scores = data.get("scores", [])
+        # Validate structure
+        valid = []
+        for s in scores:
+            rel = s.get("relevance")
+            faith = s.get("faithfulness")
+            if isinstance(rel, (int, float)) and isinstance(faith, (int, float)):
+                valid.append({
+                    "result_index": s.get("result_index", 0),
+                    "relevance": max(1, min(5, rel)),
+                    "faithfulness": max(1, min(5, faith)),
+                    "reasoning": s.get("reasoning", ""),
+                })
+        return valid
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def llm_judge_eval(
+    query: str,
+    results: list[dict],
+    answer: str | None = None,
+    llm_call=None,
+) -> tuple[float | None, float | None]:
+    """Score query results using an LLM judge.
+
+    Returns (avg_relevance, avg_faithfulness) as floats 1-5,
+    or (None, None) on failure.
+    """
+    if llm_call is None:
+        llm_call = _llm_judge_call
+
+    if not results:
+        return None, None
+
+    # Format results for prompt
+    results_text = ""
+    for i, r in enumerate(results):
+        content = r.get("content", "")[:500]
+        results_text += f"[{i}] {content}\n\n"
+
+    reference = ""
+    if answer:
+        reference = f"Reference answer: {answer}\n"
+
+    prompt = LLM_JUDGE_PROMPT.format(
+        query=query,
+        reference_answer=reference,
+        results=results_text,
+    )
+
+    try:
+        response = llm_call(prompt)
+        scores = _parse_judge_response(response)
+        if not scores:
+            logger.warning("LLM judge returned no valid scores for query: %s", query[:60])
+            return None, None
+
+        avg_rel = sum(s["relevance"] for s in scores) / len(scores)
+        avg_faith = sum(s["faithfulness"] for s in scores) / len(scores)
+        return avg_rel, avg_faith
+    except Exception as e:
+        logger.warning("LLM judge failed for query '%s': %s", query[:60], e)
+        return None, None
+
+
+def run_eval(conn, cases: list[EvalCase], top_k: int = 5, llm_judge: bool = False, llm_call=None) -> EvalReport:
     """Run all eval cases against current DB state. Return scored report.
 
     When a case has query_variants, a random variant is selected each run
     so the eval doesn't overfit to a single phrasing.
+
+    If llm_judge=True, each case is also scored by an LLM on relevance and
+    faithfulness (1-5 scale). The llm_call parameter allows injecting a mock.
     """
     from cortex.query import query
 
     case_results = []
+    # Cache results per case for LLM judge pass
+    case_query_results = []
     for case in cases:
         selected_query = case.pick_query()
         results = query(conn, selected_query, top_k=top_k)
         cr = _eval_single(results, case)
         case_results.append(cr)
+        case_query_results.append((case, selected_query, results))
+
+    # LLM judge pass
+    if llm_judge:
+        for i, (case, selected_query, results) in enumerate(case_query_results):
+            rel, faith = llm_judge_eval(
+                selected_query, results, answer=case.answer or None, llm_call=llm_call
+            )
+            case_results[i].llm_relevance = rel
+            case_results[i].llm_faithfulness = faith
 
     total = len(case_results)
     avg_relevance = sum(cr.relevance_hit for cr in case_results) / total if total else 0.0
     avg_precision = sum(cr.precision for cr in case_results) / total if total else 0.0
     avg_noise = sum(cr.noise for cr in case_results) / total if total else 0.0
+
+    # Compute LLM averages if any scores exist
+    llm_rels = [cr.llm_relevance for cr in case_results if cr.llm_relevance is not None]
+    llm_faiths = [cr.llm_faithfulness for cr in case_results if cr.llm_faithfulness is not None]
+    avg_llm_rel = sum(llm_rels) / len(llm_rels) if llm_rels else None
+    avg_llm_faith = sum(llm_faiths) / len(llm_faiths) if llm_faiths else None
 
     return EvalReport(
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -163,6 +318,8 @@ def run_eval(conn, cases: list[EvalCase], top_k: int = 5) -> EvalReport:
         avg_precision=avg_precision,
         avg_noise=avg_noise,
         case_results=case_results,
+        avg_llm_relevance=avg_llm_rel,
+        avg_llm_faithfulness=avg_llm_faith,
     )
 
 
@@ -295,6 +452,10 @@ def snapshot_eval(report: EvalReport, history_path: Path = EVAL_HISTORY_PATH) ->
         "avg_precision": report.avg_precision,
         "avg_noise": report.avg_noise,
     }
+    if report.avg_llm_relevance is not None:
+        entry["avg_llm_relevance"] = report.avg_llm_relevance
+    if report.avg_llm_faithfulness is not None:
+        entry["avg_llm_faithfulness"] = report.avg_llm_faithfulness
     with open(history_path, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -320,17 +481,30 @@ def compare_evals(history: list[dict]) -> str:
     if len(history) < 2:
         return "Not enough history to compare (need at least 2 runs)."
 
+    has_llm = any("avg_llm_relevance" in e for e in history)
+
     lines = ["Eval History (last 10 runs):", ""]
-    lines.append(f"  {'Timestamp':<28} {'Relevance':>10} {'Precision':>10} {'Noise':>10}")
-    lines.append(f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 10}")
+    header = f"  {'Timestamp':<28} {'Relevance':>10} {'Precision':>10} {'Noise':>10}"
+    divider = f"  {'-' * 28} {'-' * 10} {'-' * 10} {'-' * 10}"
+    if has_llm:
+        header += f" {'LLM Rel':>10} {'LLM Faith':>10}"
+        divider += f" {'-' * 10} {'-' * 10}"
+    lines.append(header)
+    lines.append(divider)
 
     for entry in history[-10:]:
-        lines.append(
+        row = (
             f"  {entry['timestamp']:<28} "
             f"{entry['avg_relevance']:>9.1%} "
             f"{entry['avg_precision']:>9.1%} "
             f"{entry['avg_noise']:>9.1%}"
         )
+        if has_llm:
+            llm_rel = entry.get("avg_llm_relevance")
+            llm_faith = entry.get("avg_llm_faithfulness")
+            row += f" {llm_rel:>9.2f}" if llm_rel is not None else f" {'--':>9}"
+            row += f" {llm_faith:>9.2f}" if llm_faith is not None else f" {'--':>9}"
+        lines.append(row)
 
     # Compute delta between first and last
     first, last = history[0], history[-1]
@@ -339,11 +513,20 @@ def compare_evals(history: list[dict]) -> str:
     noise_delta = last["avg_noise"] - first["avg_noise"]
 
     lines.append("")
-    lines.append(
+    trend = (
         f"  Trend: relevance {'+' if rel_delta >= 0 else ''}{rel_delta:.1%}, "
         f"precision {'+' if prec_delta >= 0 else ''}{prec_delta:.1%}, "
         f"noise {'+' if noise_delta >= 0 else ''}{noise_delta:.1%}"
     )
+    if has_llm and "avg_llm_relevance" in last and "avg_llm_relevance" in first:
+        lr_delta = (last.get("avg_llm_relevance") or 0) - (first.get("avg_llm_relevance") or 0)
+        lf_delta = (last.get("avg_llm_faithfulness") or 0) - (first.get("avg_llm_faithfulness") or 0)
+        trend += (
+            f", llm_rel {'+' if lr_delta >= 0 else ''}{lr_delta:.2f}"
+            f", llm_faith {'+' if lf_delta >= 0 else ''}{lf_delta:.2f}"
+        )
+    lines.append(trend)
+
     better = rel_delta > 0 or prec_delta > 0 or noise_delta < 0
     lines.append(f"  Overall: {'IMPROVING' if better else 'DEGRADING or STABLE'}")
 
