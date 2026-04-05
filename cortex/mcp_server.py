@@ -12,6 +12,7 @@ Boot:
 import asyncio
 import json
 import os
+import time as _time
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.lowlevel.server import NotificationOptions
@@ -27,8 +28,7 @@ RELEVANCE_THRESHOLD = 0.85
 mcp = FastMCP("cortex-history-channel")
 
 # --- Session state for background push ---
-_session_ref = None
-_monitor_started = False
+_write_stream_ref = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,17 +91,6 @@ async def search_project_history(
         query_text: Natural language query describing what you're looking for.
         project_name: Optional project directory name to filter results by.
     """
-    global _session_ref, _monitor_started
-
-    # Capture the session on first call so the background monitor can push
-    if not _monitor_started:
-        try:
-            _session_ref = mcp._mcp_server.request_context.session
-            asyncio.create_task(_monitor_active_session())
-            _monitor_started = True
-        except (LookupError, AttributeError):
-            pass  # Push won't work, but pull still does
-
     if not DB_PATH.exists():
         return "Cortex database not initialized. Run `cortex init` first."
 
@@ -124,8 +113,8 @@ async def search_project_history(
 # ---------------------------------------------------------------------------
 
 async def _send_channel_event(content: str, meta: dict | None = None):
-    """Emit a notifications/claude/channel event over the captured session."""
-    if _session_ref is None:
+    """Emit a notifications/claude/channel event over the write stream."""
+    if _write_stream_ref is None:
         return
 
     params = {"content": content}
@@ -137,26 +126,39 @@ async def _send_channel_event(content: str, meta: dict | None = None):
         method="notifications/claude/channel",
         params=params,
     )
-    await _session_ref._write_stream.send(
+    await _write_stream_ref.send(
         SessionMessage(message=JSONRPCMessage(notification))
     )
 
+    # Write sidecar for statusline visibility
+    try:
+        signal_file = DB_PATH.parent / "last_signal.json"
+        signal_file.write_text(json.dumps({
+            "ts": int(_time.time()),
+            "score": meta.get("score", "?") if meta else "?",
+            "snippet": content[:80].replace("\n", " "),
+        }))
+    except OSError:
+        pass
+
 
 async def _evaluate_and_push(user_text: str):
-    """Query Cortex and push a channel event if above threshold."""
+    """Query Cortex for distillations and push a channel event if above threshold."""
     if not DB_PATH.exists():
         return
 
     conn = get_connection()
     try:
-        results = query(conn, user_text, top_k=1)
+        results = query(conn, user_text, top_k=4)
     finally:
         conn.close()
 
-    if not results:
+    # Only push distillations — raw entries are noisy and not actionable context
+    distillations = [r for r in results if r.get("kind") == "distillation"]
+    if not distillations:
         return
 
-    top = results[0]
+    top = distillations[0]
     score = top.get("score", 0)
     if score < RELEVANCE_THRESHOLD:
         return
@@ -166,7 +168,8 @@ async def _evaluate_and_push(user_text: str):
         meta={
             "severity": "info",
             "score": str(score),
-            "kind": top.get("kind", "entry"),
+            "kind": "distillation",
+            "type": top.get("type", "unknown"),
         },
     )
 
@@ -238,7 +241,10 @@ def _run():
     )
 
     async def _main():
+        global _write_stream_ref
         async with stdio_server() as (read_stream, write_stream):
+            _write_stream_ref = write_stream
+            asyncio.create_task(_monitor_active_session())
             await low_level.run(read_stream, write_stream, init_options)
 
     asyncio.run(_main())
