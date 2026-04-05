@@ -1,0 +1,30 @@
+target: cortex/query.py
+
+run: cortex improve --diagnose
+gate: cortex eval
+
+failure_modes:
+  - name: bad_question
+    signal: "relevance miss where the query is vague or poorly worded"
+    fix: "cortex improve --update-case INDEX --query 'better query' --keywords 'word1,word2'"
+    edit: eval cases
+
+  - name: stale_case
+    signal: "expected keywords don't match what's actually in the DB"
+    fix: "cortex improve --update-case INDEX --keywords 'updated,keywords'"
+    edit: eval cases
+
+  - name: bad_data
+    signal: "noisy/low-quality entries ranking above useful ones"
+    fix: "cortex improve --adjust-confidence ENTRY_ID 0.5"
+    edit: entry confidence
+
+  - name: missing_data
+    signal: "query is reasonable but the knowledge isn't in Cortex"
+    fix: "cortex write 'the missing knowledge' --type observation"
+    edit: ledger
+
+  - name: retrieval_issue
+    signal: "data exists, query is good, but ranking puts it too low"
+    fix: "flag for code-level fix in learnings.md — don't attempt in this loop"
+    edit: none
