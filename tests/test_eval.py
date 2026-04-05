@@ -10,11 +10,17 @@ from cortex.eval import (
     CaseResult,
     EvalCase,
     EvalReport,
+    _case_key,
     _content_matches_any,
     _eval_single,
+    _parse_adversarial_response,
+    load_case_history,
     load_eval_cases,
+    retire_stale_cases,
     run_eval,
+    save_case_history,
     save_eval_cases,
+    update_case_history,
 )
 
 
@@ -270,3 +276,188 @@ def test_run_eval_produces_report(sample_cases):
     assert "UTC" in report.timestamp
     # query was called once per case
     assert mock_query.call_count == 2
+
+
+# --- Test case key derivation ---
+
+
+def test_case_key_uses_description():
+    case = EvalCase(
+        query="some query",
+        expected_keywords=["k"],
+        anti_keywords=[],
+        description="My unique case",
+    )
+    assert _case_key(case) == "My unique case"
+
+
+def test_case_key_falls_back_to_query():
+    case = EvalCase(
+        query="fallback query",
+        expected_keywords=["k"],
+        anti_keywords=[],
+        description="",
+    )
+    assert _case_key(case) == "fallback query"
+
+
+# --- Test case history tracking ---
+
+
+def test_load_save_case_history(tmp_path):
+    path = tmp_path / "history.json"
+    assert load_case_history(path) == {}
+
+    history = {"case1": {"consecutive_passes": 3, "total_runs": 5, "last_run": "2026-04-01"}}
+    save_case_history(path, history)
+
+    loaded = load_case_history(path)
+    assert loaded["case1"]["consecutive_passes"] == 3
+    assert loaded["case1"]["total_runs"] == 5
+
+
+def test_update_case_history_increments_on_pass():
+    case = EvalCase(
+        query="q", expected_keywords=["k"], anti_keywords=[], description="pass case"
+    )
+    report = EvalReport(
+        timestamp="2026-04-05",
+        total_cases=1,
+        avg_relevance=1.0,
+        avg_precision=0.8,
+        avg_noise=0.0,
+        case_results=[
+            CaseResult(case=case, relevance_hit=True, precision=0.8, noise=0.0, top_result_preview="ok"),
+        ],
+    )
+    history = {}
+    update_case_history(history, report)
+    assert history["pass case"]["consecutive_passes"] == 1
+    assert history["pass case"]["total_runs"] == 1
+
+    # Run again — should increment
+    update_case_history(history, report)
+    assert history["pass case"]["consecutive_passes"] == 2
+    assert history["pass case"]["total_runs"] == 2
+
+
+def test_update_case_history_resets_on_fail():
+    case = EvalCase(
+        query="q", expected_keywords=["k"], anti_keywords=[], description="fail case"
+    )
+    history = {"fail case": {"consecutive_passes": 5, "total_runs": 10, "last_run": "2026-04-01"}}
+
+    # Failing report (relevance_hit=False)
+    report = EvalReport(
+        timestamp="2026-04-05",
+        total_cases=1,
+        avg_relevance=0.0,
+        avg_precision=0.0,
+        avg_noise=0.0,
+        case_results=[
+            CaseResult(case=case, relevance_hit=False, precision=0.0, noise=0.5, top_result_preview="bad"),
+        ],
+    )
+    update_case_history(history, report)
+    assert history["fail case"]["consecutive_passes"] == 0
+    assert history["fail case"]["total_runs"] == 11
+
+
+def test_update_case_history_resets_on_low_precision():
+    """A case with relevance_hit=True but precision < 0.4 should reset."""
+    case = EvalCase(
+        query="q", expected_keywords=["k"], anti_keywords=[], description="low prec"
+    )
+    history = {"low prec": {"consecutive_passes": 3, "total_runs": 5, "last_run": "2026-04-01"}}
+
+    report = EvalReport(
+        timestamp="2026-04-05",
+        total_cases=1,
+        avg_relevance=1.0,
+        avg_precision=0.2,
+        avg_noise=0.0,
+        case_results=[
+            CaseResult(case=case, relevance_hit=True, precision=0.2, noise=0.0, top_result_preview="meh"),
+        ],
+    )
+    update_case_history(history, report)
+    assert history["low prec"]["consecutive_passes"] == 0
+
+
+# --- Test retirement ---
+
+
+def test_retire_stale_cases():
+    cases = [
+        EvalCase(query="q1", expected_keywords=["k"], anti_keywords=[], description="stable"),
+        EvalCase(query="q2", expected_keywords=["k"], anti_keywords=[], description="unstable"),
+        EvalCase(query="q3", expected_keywords=["k"], anti_keywords=[], description="borderline"),
+    ]
+    history = {
+        "stable": {"consecutive_passes": 12, "total_runs": 20, "last_run": "2026-04-05"},
+        "unstable": {"consecutive_passes": 3, "total_runs": 10, "last_run": "2026-04-05"},
+        "borderline": {"consecutive_passes": 10, "total_runs": 15, "last_run": "2026-04-05"},
+    }
+
+    active, retired = retire_stale_cases(cases, history, threshold=10)
+
+    assert len(retired) == 2  # stable (12) and borderline (10)
+    assert len(active) == 1
+    assert active[0].description == "unstable"
+    retired_descs = {c.description for c in retired}
+    assert "stable" in retired_descs
+    assert "borderline" in retired_descs
+
+
+def test_retire_no_history():
+    """Cases with no history entry should not be retired."""
+    cases = [
+        EvalCase(query="q", expected_keywords=["k"], anti_keywords=[], description="new case"),
+    ]
+    active, retired = retire_stale_cases(cases, {}, threshold=10)
+    assert len(active) == 1
+    assert len(retired) == 0
+
+
+# --- Test adversarial case parsing ---
+
+
+def test_parse_adversarial_response_valid():
+    response = """Here are some cases:
+[
+  {
+    "query": "fly.io deploy issues",
+    "expected_keywords": ["fly", "deploy"],
+    "anti_keywords": ["heroku"],
+    "description": "Cross-project fly.io retrieval",
+    "answer": "fly deployment issues",
+    "query_variants": ["fly deployment problems"]
+  },
+  {
+    "query": "avoid sqlite pitfalls",
+    "expected_keywords": ["sqlite", "pitfall"],
+    "anti_keywords": [],
+    "description": "Negation: sqlite mistakes",
+    "answer": "common sqlite mistakes",
+    "query_variants": []
+  }
+]
+"""
+    cases = _parse_adversarial_response(response)
+    assert len(cases) == 2
+    assert cases[0].query == "fly.io deploy issues"
+    assert cases[0].description == "Cross-project fly.io retrieval"
+    assert cases[1].anti_keywords == []
+
+
+def test_parse_adversarial_response_invalid():
+    assert _parse_adversarial_response("not json at all") == []
+    assert _parse_adversarial_response("") == []
+
+
+def test_parse_adversarial_response_partial():
+    """Items missing required 'query' field should be skipped."""
+    response = '[{"query": "good", "expected_keywords": ["k"]}, {"description": "no query"}]'
+    cases = _parse_adversarial_response(response)
+    assert len(cases) == 1
+    assert cases[0].query == "good"
