@@ -387,5 +387,40 @@ def test_codex_provider_ingests_archived_sessions_and_is_idempotent(db, tmp_path
     assert run_provider_ingest(db, provider)["ingested"] == 0
 
 
+def test_codex_provider_supports_legacy_assistant_response_items(db, tmp_path):
+    sessions = tmp_path / "sessions"
+    session = sessions / "rollout-legacy-session.jsonl"
+    _write_codex_records(
+        session,
+        [
+            {"type": "session_meta", "payload": {"id": "legacy-session", "cwd": "/tmp/proj"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Legacy question"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "[external_agent_tool_call: x]"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Legacy final answer"}],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+        ],
+    )
+    provider = CodexProvider(sessions_dir=sessions, archived_sessions_dir=tmp_path / "archive")
+
+    assert run_provider_ingest(db, provider)["ingested"] == 1
+    content = db.execute("SELECT content FROM entries").fetchone()[0]
+    assert content == "USER: Legacy question\nASSISTANT: Legacy final answer"
+
+
 def test_codex_provider_is_registered():
     assert isinstance(get_provider("codex"), CodexProvider)

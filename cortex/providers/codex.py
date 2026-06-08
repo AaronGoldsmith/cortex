@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 def _state_key(session_path: Path) -> str:
     """Use the rollout filename so state follows sessions moved to the archive."""
-    return f"codex:session:{session_path.stem}"
+    return f"codex:v2:session:{session_path.stem}"
 
 
 def _load_state(conn: sqlite3.Connection, session_path: Path) -> dict:
@@ -50,6 +50,23 @@ def _project_name(cwd: str | None) -> str | None:
 
 def _format_turn(user_text: str, assistant_text: str) -> str:
     return f"USER: {user_text.strip()}\nASSISTANT: {assistant_text.strip()}"
+
+
+def _legacy_assistant_text(payload: dict) -> str | None:
+    """Extract old-format assistant text while excluding embedded tool traffic."""
+    if payload.get("type") != "message" or payload.get("role") != "assistant":
+        return None
+    content = payload.get("content")
+    blocks = content if isinstance(content, list) else []
+    texts = [
+        block.get("text", "").strip()
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "output_text"
+    ]
+    text = "\n".join(part for part in texts if part).strip()
+    if not text or text.startswith("[external_agent_tool_"):
+        return None
+    return text
 
 
 class CodexProvider:
@@ -97,6 +114,7 @@ class CodexProvider:
 
             pending_user = state.get("pending_user")
             pending_assistant = state.get("pending_assistant")
+            pending_legacy_assistant = state.get("pending_legacy_assistant")
             current_turn_id = state.get("current_turn_id")
             session_id = state.get("session_id", session_path.stem)
             source_project = state.get("source_project")
@@ -128,6 +146,11 @@ class CodexProvider:
                             session_id = payload.get("id") or session_id
                             source_project = _project_name(payload.get("cwd"))
                             continue
+                        if record_type == "response_item":
+                            legacy_text = _legacy_assistant_text(payload)
+                            if legacy_text:
+                                pending_legacy_assistant = legacy_text
+                            continue
                         if record_type != "event_msg":
                             continue
 
@@ -136,6 +159,7 @@ class CodexProvider:
                             current_turn_id = payload.get("turn_id")
                             pending_user = None
                             pending_assistant = None
+                            pending_legacy_assistant = None
                         elif event_type == "user_message":
                             pending_user = payload.get("message")
                         elif (
@@ -145,9 +169,10 @@ class CodexProvider:
                             pending_assistant = payload.get("message")
                         elif event_type == "task_complete":
                             completed_turn_id = payload.get("turn_id")
+                            assistant_text = pending_assistant or pending_legacy_assistant
                             if (
                                 pending_user
-                                and pending_assistant
+                                and assistant_text
                                 and (
                                     not current_turn_id
                                     or not completed_turn_id
@@ -155,7 +180,7 @@ class CodexProvider:
                                 )
                             ):
                                 yield IngestEntry(
-                                    content=_format_turn(pending_user, pending_assistant),
+                                    content=_format_turn(pending_user, assistant_text),
                                     entry_type="raw",
                                     source_model="codex",
                                     source_project=source_project,
@@ -166,10 +191,12 @@ class CodexProvider:
                                 turn_index += 1
                             pending_user = None
                             pending_assistant = None
+                            pending_legacy_assistant = None
                             current_turn_id = None
                         elif event_type == "turn_aborted":
                             pending_user = None
                             pending_assistant = None
+                            pending_legacy_assistant = None
                             current_turn_id = None
             except OSError as exc:
                 log.warning("Failed reading Codex session %s: %s", session_path, exc)
@@ -182,6 +209,7 @@ class CodexProvider:
                     "offset": new_offset,
                     "pending_user": pending_user,
                     "pending_assistant": pending_assistant,
+                    "pending_legacy_assistant": pending_legacy_assistant,
                     "current_turn_id": current_turn_id,
                     "session_id": session_id,
                     "source_project": source_project,
