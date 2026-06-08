@@ -20,7 +20,13 @@ from cortex.config import (
 @click.group()
 def main():
     """Cortex — persistent, model-agnostic knowledge ledger."""
-    pass
+    # Stored knowledge can contain Unicode that redirected Windows streams
+    # using a legacy code page cannot encode. Keep output readable instead of
+    # crashing after the command has completed its work.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="replace")
 
 
 @main.command()
