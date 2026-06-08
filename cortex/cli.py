@@ -89,7 +89,7 @@ def query(text, top_k, project):
 
 
 @main.command()
-@click.option("--source", type=click.Choice(["claude", "goose", "all"]), default="claude",
+@click.option("--source", type=click.Choice(["claude", "codex", "goose", "all"]), default="claude",
               help="Data source to ingest from (default: claude)")
 @click.option("--background", is_flag=True, help="Run in background (for hooks)")
 @click.option("--memory", is_flag=True, help="Also ingest .claude/projects/*/memory/*.md files")
@@ -110,7 +110,7 @@ def ingest(source, background, memory, subagents, ingest_all, backfill_turns):
         else:
             popen_kwargs["start_new_session"] = True
         subprocess.Popen(
-            [sys.executable, "-m", "cortex.cli", "ingest"],
+            [sys.executable, "-m", "cortex.cli", "ingest", "--source", source],
             **popen_kwargs,
         )
         return

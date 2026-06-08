@@ -20,6 +20,11 @@ CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_PATH = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
+# Codex
+CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
+CODEX_ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
+
 # Goose
 if platform.system() == "Windows":
     _appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))

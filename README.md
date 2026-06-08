@@ -33,10 +33,12 @@ cortex query "how do I deploy to fly.io"
 | Tool | Format | Flag |
 |------|--------|------|
 | Claude Code | `~/.claude/history.jsonl` + memory files + subagent logs | `--source claude` (default) |
+| Codex | `~/.codex/sessions/**/*.jsonl` + archived sessions | `--source codex` |
 | Goose (Block) | `sessions.db` SQLite database | `--source goose` |
 
 ```bash
 cortex ingest                    # Claude Code only (default)
+cortex ingest --source codex     # Codex completed conversation turns
 cortex ingest --source goose     # Goose only
 cortex ingest --source all       # all detected tools
 cortex ingest --all              # Claude history + memory files + subagent logs
@@ -50,6 +52,7 @@ Adding a new source means writing a provider module in `cortex/providers/` that 
 
 ```bash
 cortex ingest                          # Claude history (default)
+cortex ingest --source codex           # Codex sessions, including one-time backfill
 cortex ingest --source goose           # Goose sessions
 cortex ingest --source all             # all detected providers
 cortex ingest --memory                 # also ingest Claude memory .md files
@@ -60,6 +63,16 @@ cortex ingest --background             # run as background process (for hooks)
 ```
 
 Ingestion is idempotent -- running it multiple times produces the same result.
+
+Codex ingestion stores one combined `USER`/`ASSISTANT` entry per completed turn.
+It ignores internal instructions, tool calls, and progress commentary. Re-running
+the command incrementally reads only new session data, so it is suitable for a
+local scheduled task.
+
+For automatic Codex sync, schedule `cortex ingest --source codex` to run every
+five minutes with your operating system's scheduler. Run it directly rather
+than through an AI automation: ingestion is local, incremental, and does not
+need model tokens.
 
 ### Query
 
