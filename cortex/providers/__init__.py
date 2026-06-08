@@ -12,9 +12,8 @@ _PROVIDER_FACTORIES: dict[str, type] = {}
 
 def _ensure_registered():
     """Lazily import provider classes so they register themselves."""
-    if _PROVIDER_FACTORIES:
-        return
     from cortex.providers.claude import ClaudeHistoryProvider  # noqa: F401
+    from cortex.providers.codex import CodexProvider  # noqa: F401
     from cortex.providers.goose import GooseProvider  # noqa: F401
 
 

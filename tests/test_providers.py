@@ -7,7 +7,9 @@ import pytest
 
 from cortex.db import init_db, get_connection
 from cortex.ingest import run_provider_ingest
+from cortex.providers import get_provider
 from cortex.providers.claude import ClaudeHistoryProvider
+from cortex.providers.codex import CodexProvider
 from cortex.providers.goose import GooseProvider
 
 
@@ -254,3 +256,171 @@ def test_goose_provider_source_model_includes_provider(db, tmp_path):
 
     row = db.execute("SELECT source_model FROM entries").fetchone()
     assert row[0] == "goose/chatgpt_codex"
+
+
+# ---------------------------------------------------------------------------
+# Codex provider tests
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_records(path, records, append=False, trailing_newline=True):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(json.dumps(record) for record in records)
+    if trailing_newline:
+        text += "\n"
+    with open(path, "a" if append else "w", encoding="utf-8") as session_file:
+        session_file.write(text)
+
+
+def _codex_turn(turn_id, user, assistant, complete=True):
+    records = [
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": user}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "commentary",
+                "message": "Working on it",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "final_answer",
+                "message": assistant,
+            },
+        },
+    ]
+    if complete:
+        records.append(
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}
+        )
+    return records
+
+
+def test_codex_provider_ingests_completed_turns_only(db, tmp_path):
+    sessions = tmp_path / "sessions"
+    session = sessions / "2026" / "01" / "01" / "rollout-session-1.jsonl"
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {"id": "session-1", "cwd": "/home/user/myproject"},
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "developer", "content": "ignore me"},
+        },
+        *_codex_turn("turn-1", "How should this work?", "Use the provider pattern."),
+        *_codex_turn("turn-2", "This turn is incomplete", "Not ingested yet.", complete=False),
+    ]
+    _write_codex_records(session, records)
+
+    provider = CodexProvider(sessions_dir=sessions, archived_sessions_dir=tmp_path / "archive")
+    stats = run_provider_ingest(db, provider)
+
+    assert stats == {"ingested": 1, "skipped": 0, "errors": 0}
+    row = db.execute(
+        "SELECT content, source_model, source_project, session_id, turn_index FROM entries"
+    ).fetchone()
+    assert row[0] == "USER: How should this work?\nASSISTANT: Use the provider pattern."
+    assert row[1:] == ("codex", "myproject", "session-1", 0)
+
+
+def test_codex_provider_resumes_incomplete_turn(db, tmp_path):
+    sessions = tmp_path / "sessions"
+    session = sessions / "rollout-session-1.jsonl"
+    _write_codex_records(
+        session,
+        [
+            {"type": "session_meta", "payload": {"id": "session-1", "cwd": "/tmp/proj"}},
+            *_codex_turn("turn-1", "Remember this question", "Remember this answer", complete=False),
+        ],
+    )
+    provider = CodexProvider(sessions_dir=sessions, archived_sessions_dir=tmp_path / "archive")
+    assert run_provider_ingest(db, provider)["ingested"] == 0
+
+    _write_codex_records(
+        session,
+        [{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}}],
+        append=True,
+    )
+    assert run_provider_ingest(db, provider)["ingested"] == 1
+    assert db.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 1
+
+
+def test_codex_provider_leaves_partial_line_for_next_sync(db, tmp_path):
+    sessions = tmp_path / "sessions"
+    session = sessions / "rollout-session-1.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "session-1", "cwd": "/tmp/proj"}},
+        *_codex_turn("turn-1", "Partial line question", "Partial line answer"),
+    ]
+    _write_codex_records(session, records[:-1])
+    partial = json.dumps(records[-1])
+    with open(session, "a", encoding="utf-8") as session_file:
+        session_file.write(partial[: len(partial) // 2])
+
+    provider = CodexProvider(sessions_dir=sessions, archived_sessions_dir=tmp_path / "archive")
+    assert run_provider_ingest(db, provider)["ingested"] == 0
+
+    with open(session, "a", encoding="utf-8") as session_file:
+        session_file.write(partial[len(partial) // 2 :] + "\n")
+    assert run_provider_ingest(db, provider)["ingested"] == 1
+
+
+def test_codex_provider_ingests_archived_sessions_and_is_idempotent(db, tmp_path):
+    archive = tmp_path / "archived"
+    session = archive / "rollout-archived-session.jsonl"
+    _write_codex_records(
+        session,
+        [
+            {"type": "session_meta", "payload": {"id": "archived-session", "cwd": "/tmp/proj"}},
+            *_codex_turn("turn-1", "Archived question", "Archived answer"),
+        ],
+    )
+    provider = CodexProvider(sessions_dir=tmp_path / "sessions", archived_sessions_dir=archive)
+
+    assert provider.detect() is True
+    assert run_provider_ingest(db, provider)["ingested"] == 1
+    assert run_provider_ingest(db, provider)["ingested"] == 0
+
+
+def test_codex_provider_supports_legacy_assistant_response_items(db, tmp_path):
+    sessions = tmp_path / "sessions"
+    session = sessions / "rollout-legacy-session.jsonl"
+    _write_codex_records(
+        session,
+        [
+            {"type": "session_meta", "payload": {"id": "legacy-session", "cwd": "/tmp/proj"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Legacy question"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "[external_agent_tool_call: x]"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Legacy final answer"}],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+        ],
+    )
+    provider = CodexProvider(sessions_dir=sessions, archived_sessions_dir=tmp_path / "archive")
+
+    assert run_provider_ingest(db, provider)["ingested"] == 1
+    content = db.execute("SELECT content FROM entries").fetchone()[0]
+    assert content == "USER: Legacy question\nASSISTANT: Legacy final answer"
+
+
+def test_codex_provider_is_registered():
+    assert isinstance(get_provider("codex"), CodexProvider)
